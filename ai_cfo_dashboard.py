@@ -8,6 +8,7 @@ import io
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(page_title="AI CFO — Dashboard", layout="wide")
@@ -250,7 +251,10 @@ def kpis_from_filtered(df: pd.DataFrame) -> dict:
 
 def fmt_money(x):
     try:
-        return f"{float(x):,.2f}"
+        val = float(x)
+        if not np.isfinite(val):
+            return "—"
+        return f"{val:,.2f}"
     except Exception:
         return "—"
 
@@ -305,6 +309,22 @@ else:
 type_options = ["REVENUE", "EXPENSE"]
 selected_types = st.sidebar.multiselect("Type", options=type_options, default=type_options)
 
+st.sidebar.header("Targets")
+rev_target = st.sidebar.number_input(
+    "Revenue target",
+    min_value=0.0,
+    value=0.0,
+    step=1000.0,
+    help="Target revenue for the currently selected period."
+)
+exp_target = st.sidebar.number_input(
+    "Expenses target",
+    min_value=0.0,
+    value=0.0,
+    step=1000.0,
+    help="Target expenses for the currently selected period."
+)
+
 # =========================
 # Apply Filters
 # =========================
@@ -325,8 +345,22 @@ col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Cash balance", fmt_money(kpi["cash"]))
 col2.metric("Burn rate (avg monthly expenses)", fmt_money(kpi["burn"]))
 col3.metric("Runway (months)", fmt_runway(kpi["runway"]))
-col4.metric("Expenses", fmt_money(kpi["expenses"]))
-col5.metric("Revenue", fmt_money(kpi["revenue"]))
+
+exp_delta = kpi["expenses"] - exp_target if exp_target else None
+rev_delta = kpi["revenue"] - rev_target if rev_target else None
+
+col4.metric(
+    "Expenses",
+    fmt_money(kpi["expenses"]),
+    delta=fmt_money(exp_delta) if exp_delta is not None else None,
+    delta_color="inverse"
+)
+col5.metric(
+    "Revenue",
+    fmt_money(kpi["revenue"]),
+    delta=fmt_money(rev_delta) if rev_delta is not None else None,
+    delta_color="normal"
+)
 # --- CFO context helpers (place near other helpers, BEFORE the UI code) ---
 def _periodize(df, months=1):
     if df.empty:
@@ -890,15 +924,55 @@ if not df.empty:
     tab1, tab2 = st.tabs(["Daily Net", "Monthly Revenue vs Expenses"])
 
     with tab1:
-        import plotly.express as px
+        daily_sorted = daily.sort_values("Day").dropna(subset=["Day"])
         fig = px.line(
-            daily.sort_values("Day"),
+            daily_sorted,
             x="Day", y=["Revenue", "Expenses", "Net"],
             title="Daily Revenue / Expenses / Net"
         )
         fig.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
         fig.update_xaxes(tickformat="%d/%m/%Y")
+
+        color_lookup = {trace.name: trace.line.color for trace in fig.data}
+        ordinal_days = daily_sorted["Day"].map(pd.Timestamp.toordinal).to_numpy()
+        avg_positions = {"Revenue": "top left", "Expenses": "top right", "Net": "bottom left"}
+
+        for metric in ["Revenue", "Expenses", "Net"]:
+            if metric not in daily_sorted.columns or len(daily_sorted) < 2:
+                continue
+            y_vals = daily_sorted[metric].to_numpy(dtype=float)
+            if not np.isfinite(y_vals).any() or np.unique(ordinal_days).size < 2:
+                continue
+            coeffs = np.polyfit(ordinal_days, y_vals, 1)
+            trend = coeffs[0] * ordinal_days + coeffs[1]
+            fig.add_trace(
+                go.Scatter(
+                    x=daily_sorted["Day"],
+                    y=trend,
+                    name=f"{metric} trend",
+                    mode="lines",
+                    line=dict(color=color_lookup.get(metric), dash="dash"),
+                    showlegend=True,
+                )
+            )
+            avg_val = float(np.nanmean(y_vals))
+            if np.isfinite(avg_val):
+                fig.add_hline(
+                    y=avg_val,
+                    line_dash="dot",
+                    line_color=color_lookup.get(metric),
+                    annotation_text=f"{metric} avg {fmt_money(avg_val)}",
+                    annotation_position=avg_positions.get(metric, "top left"),
+                )
+
         st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+        st.caption(
+            "Daily averages — Revenue: {} • Expenses: {} • Net: {}".format(
+                fmt_money(np.nanmean(daily_sorted["Revenue"])),
+                fmt_money(np.nanmean(daily_sorted["Expenses"])),
+                fmt_money(np.nanmean(daily_sorted["Net"])),
+            )
+        )
 
     with tab2:
         # Ensure YearMonth exists on the filtered frame
@@ -919,15 +993,74 @@ if not df.empty:
 
         # Merge and plot
         m_df = pd.merge(monthly_rev, monthly_exp, on="YearMonth", how="outer").fillna(0.0)
-        m_df["YearMonth"] = format_month_period(m_df["YearMonth"])
+        m_df = m_df.sort_values("YearMonth")
+        m_df_display = m_df.copy()
+        m_df_display["YearMonthLabel"] = format_month_period(m_df_display["YearMonth"])
 
         fig2 = px.bar(
-            m_df, x="YearMonth", y=["Revenue", "Expenses"],
+            m_df_display, x="YearMonthLabel", y=["Revenue", "Expenses"],
             barmode="group", title="Monthly Revenue vs Expenses"
         )
         fig2.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
         fig2.update_xaxes(tickformat="%m/%Y")
+
+        color_lookup2 = {trace.name: getattr(trace.marker, "color", None) for trace in fig2.data}
+        month_ordinals = m_df["YearMonth"].dt.to_timestamp().map(pd.Timestamp.toordinal).to_numpy()
+        avg_positions2 = {"Revenue": "top left", "Expenses": "top right"}
+
+        for metric in ["Revenue", "Expenses"]:
+            if metric not in m_df.columns or len(m_df) < 2:
+                continue
+            y_vals = m_df[metric].to_numpy(dtype=float)
+            if not np.isfinite(y_vals).any() or np.unique(month_ordinals).size < 2:
+                continue
+            coeffs = np.polyfit(month_ordinals, y_vals, 1)
+            trend = coeffs[0] * month_ordinals + coeffs[1]
+            fig2.add_trace(
+                go.Scatter(
+                    x=m_df_display["YearMonthLabel"],
+                    y=trend,
+                    name=f"{metric} trend",
+                    mode="lines",
+                    line=dict(color=color_lookup2.get(metric), dash="dash"),
+                    showlegend=True,
+                )
+            )
+            avg_val = float(np.nanmean(y_vals))
+            if np.isfinite(avg_val):
+                fig2.add_hline(
+                    y=avg_val,
+                    line_dash="dot",
+                    line_color=color_lookup2.get(metric),
+                    annotation_text=f"{metric} avg {fmt_money(avg_val)}",
+                    annotation_position=avg_positions2.get(metric, "top left"),
+                )
+
+        if rev_target:
+            fig2.add_hline(
+                y=rev_target,
+                line_dash="dash",
+                line_color=color_lookup2.get("Revenue", "#2ca02c"),
+                annotation_text=f"Revenue target {fmt_money(rev_target)}",
+                annotation_position="bottom left",
+            )
+        if exp_target:
+            fig2.add_hline(
+                y=exp_target,
+                line_dash="dash",
+                line_color=color_lookup2.get("Expenses", "#d62728"),
+                annotation_text=f"Expenses target {fmt_money(exp_target)}",
+                annotation_position="bottom right",
+            )
+
         st.plotly_chart(fig2, use_container_width=True, theme="streamlit")
+        if not m_df.empty:
+            st.caption(
+                "Monthly averages — Revenue: {} • Expenses: {}".format(
+                    fmt_money(np.nanmean(m_df["Revenue"])),
+                    fmt_money(np.nanmean(m_df["Expenses"])),
+                )
+            )
 else:
     st.info("No rows match your filters. Adjust the date range or Type filter.")
 
