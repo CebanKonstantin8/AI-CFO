@@ -259,9 +259,88 @@ def fmt_money(x):
         return "—"
 
 def fmt_runway(x):
-    if np.isinf(x): return "∞"
+    if np.isinf(x):
+        return "∞"
     return f"{x:.1f} mo"
 
+def _annualized_operating_profile(df: pd.DataFrame) -> dict:
+    """Annualise current revenue and expense run-rates from the filtered data."""
+    if df.empty:
+        return {"months": 0, "revenue": 0.0, "expenses": 0.0}
+
+    tmp = df.copy()
+    tmp["YearMonth"] = pd.to_datetime(tmp["Date"], errors="coerce", dayfirst=True).dt.to_period("M")
+    months = int(tmp["YearMonth"].nunique())
+    if months <= 0:
+        return {"months": 0, "revenue": 0.0, "expenses": 0.0}
+
+    rev = tmp[tmp["Type"] == "REVENUE"]["Amount"].abs().sum()
+    exp = tmp[tmp["Type"] == "EXPENSE"]["Amount"].abs().sum()
+
+    scale = 12.0 / months
+    return {
+        "months": months,
+        "revenue": float(rev * scale),
+        "expenses": float(exp * scale),
+    }
+
+
+def compute_dcf_projection(
+    df: pd.DataFrame,
+    wacc: float,
+    projection_years: int,
+    revenue_growth: float,
+    expense_growth: float,
+    terminal_growth: float,
+):
+    """
+    Build a simple DCF schedule using revenue/expense run-rates and growth assumptions.
+    Returns a dict with schedule DataFrame, NPV, and terminal value components.
+    """
+    base = _annualized_operating_profile(df)
+    if base["months"] == 0 or (base["revenue"] == 0 and base["expenses"] == 0):
+        return None
+
+    rows = []
+    pv_sum = 0.0
+    for year in range(1, projection_years + 1):
+        revenue = base["revenue"] * ((1 + revenue_growth) ** year)
+        expenses = base["expenses"] * ((1 + expense_growth) ** year)
+        fcf = revenue - expenses
+        discount_factor = (1 + wacc) ** year
+        discounted_fcf = fcf / discount_factor
+        pv_sum += discounted_fcf
+        rows.append(
+            {
+                "Year": year,
+                "Revenue": revenue,
+                "Expenses": expenses,
+                "FCF": fcf,
+                "Discounted FCF": discounted_fcf,
+            }
+        )
+
+    terminal_value = None
+    terminal_pv = None
+    warning = None
+    if projection_years > 0:
+        last_fcf = rows[-1]["FCF"]
+        if wacc <= terminal_growth:
+            warning = "Terminal growth must be lower than the WACC to compute a terminal value."
+        else:
+            terminal_value = last_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
+            terminal_pv = terminal_value / ((1 + wacc) ** projection_years)
+            pv_sum += terminal_pv
+
+    schedule = pd.DataFrame(rows)
+    return {
+        "base": base,
+        "schedule": schedule,
+        "npv": pv_sum,
+        "terminal_value": terminal_value,
+        "terminal_pv": terminal_pv,
+        "warning": warning,
+    }
 # =========================
 # UI — Sidebar
 # =========================
@@ -325,6 +404,40 @@ exp_target = st.sidebar.number_input(
     help="Target expenses for the currently selected period."
 )
 
+st.sidebar.header("DCF Model Inputs")
+projection_years = st.sidebar.slider(
+    "Projection years",
+    min_value=1,
+    max_value=10,
+    value=5,
+)
+rev_growth_pct = st.sidebar.number_input(
+    "Revenue growth rate (% per year)",
+    value=5.0,
+    step=0.5,
+    format="%0.1f",
+)
+exp_growth_pct = st.sidebar.number_input(
+    "Expense growth rate (% per year)",
+    value=3.0,
+    step=0.5,
+    format="%0.1f",
+)
+terminal_growth_pct = st.sidebar.number_input(
+    "Terminal growth rate (%)",
+    value=2.0,
+    step=0.5,
+    format="%0.1f",
+)
+wacc_pct = st.sidebar.number_input(
+    "WACC (%)",
+    min_value=0.1,
+    value=10.0,
+    step=0.1,
+    format="%0.1f",
+    help="Weighted Average Cost of Capital used to discount future cash flows.",
+)
+
 # =========================
 # Apply Filters
 # =========================
@@ -361,6 +474,56 @@ col5.metric(
     delta=fmt_money(rev_delta) if rev_delta is not None else None,
     delta_color="normal"
 )
+
+rev_growth = rev_growth_pct / 100.0
+exp_growth = exp_growth_pct / 100.0
+terminal_growth = terminal_growth_pct / 100.0
+wacc = wacc_pct / 100.0
+
+st.markdown("### 💰 Discounted Cash Flow (DCF) Valuation")
+dcf = compute_dcf_projection(
+    df,
+    wacc=wacc,
+    projection_years=projection_years,
+    revenue_growth=rev_growth,
+    expense_growth=exp_growth,
+    terminal_growth=terminal_growth,
+)
+
+if dcf is None:
+    st.info("Not enough data to build a DCF model. Provide more revenue and expense history.")
+else:
+    base = dcf["base"]
+    cols = st.columns(3)
+    cols[0].metric("Annualised revenue", fmt_money(base["revenue"]))
+    cols[1].metric("Annualised expenses", fmt_money(base["expenses"]))
+    cols[2].metric("Projection horizon", f"{projection_years} years")
+
+    if dcf["warning"]:
+        st.warning(dcf["warning"])
+
+    valuation = dcf["npv"]
+    terminal_pv = dcf.get("terminal_pv") or 0.0
+    st.metric("Enterprise value (DCF)", fmt_money(valuation))
+    st.caption(
+        f"Assumptions: WACC {wacc_pct:.1f}% • Revenue growth {rev_growth_pct:.1f}% • Expense growth {exp_growth_pct:.1f}% • Terminal growth {terminal_growth_pct:.1f}%"
+    )
+
+    schedule_display = dcf["schedule"].copy()
+    for col in ["Revenue", "Expenses", "FCF", "Discounted FCF"]:
+        schedule_display[col] = schedule_display[col].map(fmt_money)
+    schedule_display["Year"] = schedule_display["Year"].apply(lambda y: f"Year {y}")
+
+    st.dataframe(
+        schedule_display,
+        use_container_width=True,
+    )
+
+    if dcf.get("terminal_value") is not None:
+        st.caption(
+            f"Terminal value: {fmt_money(dcf['terminal_value'])} (PV: {fmt_money(terminal_pv)})"
+        )
+
 # --- CFO context helpers (place near other helpers, BEFORE the UI code) ---
 def _periodize(df, months=1):
     if df.empty:
@@ -431,7 +594,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 import pandas as pd
 import numpy as np
 
-def _agg_context(df, kpi):
+def _agg_context(df, kpi, revenue_target=None, expense_target=None):
     """
     Aggregate financial context from the transaction sheet for the AI CFO.
     Produces a compact structured dictionary for GPT input.
@@ -506,6 +669,18 @@ def _agg_context(df, kpi):
         .values.tolist()
     )
 
+    # Target tracking
+    targets = None
+    if revenue_target or expense_target:
+        targets = {
+            "revenue_target": float(revenue_target) if revenue_target not in (None, 0) else None,
+            "expense_target": float(expense_target) if expense_target not in (None, 0) else None,
+        }
+        if targets["revenue_target"] is not None:
+            targets["revenue_delta"] = float(kpi["revenue"] - targets["revenue_target"])
+        if targets["expense_target"] is not None:
+            targets["expense_delta"] = float(kpi["expenses"] - targets["expense_target"])
+
     # Construct final context
     return {
         "empty": False,
@@ -530,7 +705,10 @@ def _agg_context(df, kpi):
         "mom_delta": {"revenue": mom_rev, "expenses": mom_exp},
         "top5_expenses": top_exp,
         "top5_revenues": top_rev,
+        "targets": targets,
     }
+
+
 # --- Session state for conversation ---
 if "chat" not in st.session_state:
     st.session_state.chat = []   # list of {"role":"user/assistant", "content": "...", "ts": "ISO"}
@@ -554,7 +732,7 @@ def ai_cfo_reply(prompt_text: str, tone="direct", length="medium", mode="Strateg
     target_words, max_tokens = targets.get(length, (220, 600))
 
     # Build rich financial context
-    ctx = _agg_context(df, kpi)   # you already added _agg_context earlier
+    ctx = _agg_context(df, kpi, revenue_target=rev_target, expense_target=exp_target)
     if ctx.get("empty"): return "No data available. Upload transactions or widen the date range."
 
     # Conversation memory (last turns)
@@ -586,10 +764,11 @@ def ai_cfo_reply(prompt_text: str, tone="direct", length="medium", mode="Strateg
 
     # Structure with request FIRST
     instructions = (
-        "Respond in this exact order:\n"
-        "CEO Request — Direct and explicit answer to the CEO’s question FIRST, citing figures from data.+ CFO Insights\n"
-        "Conclusion that sumarizes next steps"
-        "Avoid generic advice. No code talk."
+        "Respond with Markdown using this structure:\n"
+        "1. **CEO Request Response** – Open with 2–3 sentences that address the CEO directly, cite at least two concrete metrics, and state progress versus any revenue/expense targets when provided (actual, target, variance).\n"
+        "2. **CFO Insights** – Provide a bullet list of 3–4 data-driven observations covering trends, runway, category mix, or target gaps. Keep every bullet concise and quantified.\n"
+        "3. **Next Steps** – Close with a numbered list of 2–3 decisive actions for the CEO.\n"
+        "Avoid generic advice, keep focus on provided data, and do not mention code."
     )
 
     payload = {
