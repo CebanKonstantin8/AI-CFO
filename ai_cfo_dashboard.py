@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from datetime import date
 
 st.set_page_config(page_title="AI CFO — Dashboard", layout="wide")
 
@@ -16,6 +15,9 @@ st.set_page_config(page_title="AI CFO — Dashboard", layout="wide")
 # Configuration & Aliases
 # =========================
 REQUIRED_COLS = ["Date", "Type", "Category", "Description", "Amount"]
+
+DATE_DISPLAY_FMT = "%d/%m/%Y"
+MONTH_DISPLAY_FMT = "%m/%Y"
 
 REV_ALIASES = {"REVENUE", "REV", "INCOME", "SALES", "SALE", "EARNINGS", "TURNOVER"}
 EXP_ALIASES = {"EXPENSE", "EXP", "COST", "PURCHASE", "PURCHASES", "SPEND", "SPENDING", "OUTFLOW", "PAYMENT"}
@@ -89,6 +91,27 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
 
     return out
 
+
+def format_dayfirst_scalar(val) -> str:
+    ts = pd.to_datetime(val, errors="coerce", dayfirst=True)
+    if pd.isna(ts):
+        return ""
+    return ts.strftime(DATE_DISPLAY_FMT)
+
+
+def format_dayfirst_series(series: pd.Series) -> pd.Series:
+    ts = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return ts.dt.strftime(DATE_DISPLAY_FMT).fillna("")
+
+
+def format_month_period(period_series: pd.Series) -> pd.Series:
+    if period_series.empty:
+        return period_series.astype(str)
+    try:
+        return period_series.dt.to_timestamp().dt.strftime(MONTH_DISPLAY_FMT).fillna("")
+    except Exception:
+        coerced = pd.to_datetime(period_series.astype(str), errors="coerce", dayfirst=True)
+        return coerced.dt.strftime(MONTH_DISPLAY_FMT).fillna("")
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -220,7 +243,13 @@ max_d = max_ts.date()
 default_range = (min_d, max_d) if min_d <= max_d else (max_d, min_d)
 
 st.sidebar.header("Filters")
-date_range = st.sidebar.date_input("Date range", value=default_range, min_value=min_d, max_value=max_d)
+date_range = st.sidebar.date_input(
+    "Date range",
+    value=default_range,
+    min_value=min_d,
+    max_value=max_d,
+    format="DD/MM/YYYY",
+)
 if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
     start_date, end_date = date_range
 else:
@@ -292,14 +321,16 @@ def summarize_context(df):
         "top5_expenses": (df[df["Type"]=="EXPENSE"]
                   .assign(Abs=lambda d: d["Amount"].abs())
                   .nlargest(5, "Abs")[["Date","Category","Description","Amount"]]
+                  .assign(Date=lambda d: format_dayfirst_series(d["Date"]))
                   .astype(str).values.tolist()),
         "top5_revenues": (df[df["Type"]=="REVENUE"]
                   .assign(Abs=lambda d: d["Amount"].abs())
                   .nlargest(5, "Abs")[["Date","Category","Description","Amount"]]
+                  .assign(Date=lambda d: format_dayfirst_series(d["Date"]))
                   .astype(str).values.tolist()),
 
-        "date_start": str(df["Date"].min().date()),
-        "date_end": str(df["Date"].max().date()),
+        "date_start": format_dayfirst_scalar(df["Date"].min()),
+        "date_end": format_dayfirst_scalar(df["Date"].max()),
     }
 
 st.markdown("---")
@@ -372,12 +403,16 @@ def _agg_context(df, kpi):
         mom_rev = float(m_df["Revenue"].iloc[-1] - m_df["Revenue"].iloc[-2])
         mom_exp = float(m_df["Expenses"].iloc[-1] - m_df["Expenses"].iloc[-2])
 
+    m_df_display = m_df.reset_index().rename(columns={"index": "YearMonth"})
+    if "YearMonth" in m_df_display.columns:
+        m_df_display["YearMonth"] = format_month_period(m_df_display["YearMonth"])
+
     # Top transactions
     top_exp = (
         f[f["Type"] == "EXPENSE"]
         .assign(Abs=f["Amount"].abs())
         .nlargest(5, "Abs")[["Date", "Category", "Description", "Amount"]]
-        .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d"))
+        .assign(Date=lambda d: format_dayfirst_series(d["Date"]))
         .astype(str)
         .values.tolist()
     )
@@ -385,7 +420,7 @@ def _agg_context(df, kpi):
         f[f["Type"] == "REVENUE"]
         .assign(Abs=f["Amount"].abs())
         .nlargest(5, "Abs")[["Date", "Category", "Description", "Amount"]]
-        .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d"))
+        .assign(Date=lambda d: format_dayfirst_series(d["Date"]))
         .astype(str)
         .values.tolist()
     )
@@ -394,8 +429,8 @@ def _agg_context(df, kpi):
     return {
         "empty": False,
         "period": {
-            "start": str(f["Date"].min().date()),
-            "end": str(f["Date"].max().date()),
+            "start": format_dayfirst_scalar(f["Date"].min()),
+            "end": format_dayfirst_scalar(f["Date"].max()),
         },
         "kpis": {
             "revenue": float(kpi["revenue"]),
@@ -410,7 +445,7 @@ def _agg_context(df, kpi):
             "expense_by_category": exp_by_cat,
             "revenue_by_category": rev_by_cat,
         },
-        "trend_last_12m": m_df.reset_index().astype(str).values.tolist(),
+        "trend_last_12m": m_df_display.astype(str).values.tolist(),
         "mom_delta": {"revenue": mom_rev, "expenses": mom_exp},
         "top5_expenses": top_exp,
         "top5_revenues": top_rev,
@@ -552,7 +587,7 @@ def df_to_html(df, cols, title):
         return f"<h3>{title}</h3><p>No rows.</p>"
     df2 = df.copy()
     if "Date" in df2.columns:
-        df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d")
+        df2["Date"] = format_dayfirst_series(df2["Date"])
 
     if "Amount" in df2.columns:
         df2["Amount"] = df2["Amount"].map(_moneyfmt)
@@ -572,8 +607,11 @@ def build_report_html() -> bytes:
         "runway": ("∞" if np.isinf(kpi["runway"]) else f"{kpi['runway']:.1f} mo"),
         "expenses": _moneyfmt(kpi['expenses']),
         "revenue": _moneyfmt(kpi['revenue']),
-        "period": f"{df['Date'].min().date()} → {df['Date'].max().date()}" if not df.empty else "n/a",
-        "generated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "period": (
+            f"{format_dayfirst_scalar(df['Date'].min())} → {format_dayfirst_scalar(df['Date'].max())}"
+            if not df.empty else "n/a"
+        ),
+        "generated": dt.datetime.utcnow().strftime("%d/%m/%Y %H:%M UTC"),
     }
 
     # Charts → base64 (ignore if missing)
@@ -674,9 +712,11 @@ with coly:
 
     # Current filtered transactions → CSV
     with col1:
+        tx_export = df.copy()
+        tx_export["Date"] = format_dayfirst_series(tx_export["Date"])
         st.download_button(
             "Transactions (CSV)",
-            data=df.to_csv(index=False).encode("utf-8"),
+            data=tx_export.to_csv(index=False).encode("utf-8"),
             file_name="transactions_filtered.csv",
             mime="text/csv"
         )
@@ -685,9 +725,11 @@ with coly:
     with col2:
         last10_csv = df.sort_values("Date", ascending=False).head(10)[
             ["Date", "Type", "Category", "Description", "Amount"]]
+        last10_csv_export = last10_csv.copy()
+        last10_csv_export["Date"] = format_dayfirst_series(last10_csv_export["Date"])
         st.download_button(
             "Last 10 (CSV)",
-            data=last10_csv.to_csv(index=False).encode("utf-8"),
+            data=last10_csv_export.to_csv(index=False).encode("utf-8"),
             file_name="last10.csv",
             mime="text/csv"
         )
@@ -697,9 +739,11 @@ with coly:
                         .assign(Abs=df["Amount"].abs())
                         .nlargest(5, "Abs")
                         .drop(columns="Abs"))[["Date", "Category", "Description", "Amount"]]
+        top5_exp_csv_export = top5_exp_csv.copy()
+        top5_exp_csv_export["Date"] = format_dayfirst_series(top5_exp_csv_export["Date"])
         st.download_button(
             "Top 5 expenses (CSV)",
-            data=top5_exp_csv.to_csv(index=False).encode("utf-8"),
+            data=top5_exp_csv_export.to_csv(index=False).encode("utf-8"),
             file_name="top5_expenses.csv",
             mime="text/csv"
         )
@@ -709,9 +753,11 @@ with coly:
                         .assign(Abs=df["Amount"].abs())
                         .nlargest(5, "Abs")
                         .drop(columns="Abs"))[["Date", "Category", "Description", "Amount"]]
+        top5_rev_csv_export = top5_rev_csv.copy()
+        top5_rev_csv_export["Date"] = format_dayfirst_series(top5_rev_csv_export["Date"])
         st.download_button(
             "Top 5 revenues (CSV)",
-            data=top5_rev_csv.to_csv(index=False).encode("utf-8"),
+            data=top5_rev_csv_export.to_csv(index=False).encode("utf-8"),
             file_name="top5_revenues.csv",
             mime="text/csv"
         )
@@ -742,7 +788,7 @@ with t1:
     if not kpi["last10"].empty:
         st.dataframe(
             kpi["last10"][["Date", "Type", "Category", "Description", "Amount"]]
-            .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d")),
+            .assign(Date=lambda d: format_dayfirst_series(d["Date"])),
             use_container_width=True,
             height=360
         )
@@ -753,7 +799,7 @@ with t2:
     if not kpi["top5_exp"].empty:
         st.dataframe(
             kpi["top5_exp"][["Date", "Category", "Description", "Amount"]]
-            .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d")),
+            .assign(Date=lambda d: format_dayfirst_series(d["Date"])),
             use_container_width=True,
             height=180
         )
@@ -763,7 +809,7 @@ with t2:
     if not kpi["top5_rev"].empty:
         st.dataframe(
             kpi["top5_rev"][["Date", "Category", "Description", "Amount"]]
-            .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d")),
+            .assign(Date=lambda d: format_dayfirst_series(d["Date"])),
             use_container_width=True,
             height=180
         )
@@ -804,6 +850,7 @@ if not df.empty:
             title="Daily Revenue / Expenses / Net"
         )
         fig.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
+        fig.update_xaxes(tickformat="%d/%m/%Y")
         st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
     with tab2:
@@ -825,13 +872,14 @@ if not df.empty:
 
         # Merge and plot
         m_df = pd.merge(monthly_rev, monthly_exp, on="YearMonth", how="outer").fillna(0.0)
-        m_df["YearMonth"] = m_df["YearMonth"].astype(str)
+        m_df["YearMonth"] = format_month_period(m_df["YearMonth"])
 
         fig2 = px.bar(
             m_df, x="YearMonth", y=["Revenue", "Expenses"],
             barmode="group", title="Monthly Revenue vs Expenses"
         )
         fig2.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
+        fig2.update_xaxes(tickformat="%m/%Y")
         st.plotly_chart(fig2, use_container_width=True, theme="streamlit")
 else:
     st.info("No rows match your filters. Adjust the date range or Type filter.")
@@ -864,7 +912,9 @@ with st.expander("Calculation audit"):
         if not exp_f.empty:
             burn_series = (exp_f.assign(Abs=lambda d: d["Amount"].abs())
                            .groupby("YearMonth")["Abs"].sum())
-            st.dataframe(burn_series.rename("Expenses").to_frame())
+            burn_table = burn_series.rename("Expenses").to_frame()
+            burn_table.index = format_month_period(burn_table.index.to_series()).values
+            st.dataframe(burn_table)
             st.write("**Burn (mean):**", fmt_money(burn_series.mean()))
         else:
             st.write("No expenses in filtered period.")
@@ -875,7 +925,7 @@ with st.expander("Calculation audit"):
         sample["_raw_Date"] = sample["Date"]
         parsed = smart_parse_dates(sample["_raw_Date"])
         sample["_parsed_Date"] = parsed
-        sample["_parsed_Date_str"] = parsed.dt.strftime("%Y-%m-%d")
+        sample["_parsed_Date_str"] = format_dayfirst_series(parsed)
         st.dataframe(sample[["_raw_Date", "_parsed_Date_str"]])
 
 
