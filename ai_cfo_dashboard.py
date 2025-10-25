@@ -25,50 +25,52 @@ EXP_ALIASES = {"EXPENSE", "EXP", "COST", "PURCHASE", "PURCHASES", "SPEND", "SPEN
 # =========================
 def smart_parse_dates(series: pd.Series) -> pd.Series:
     """
-    Robustly parse a mixed 'Date' column that may contain:
-      - Excel serial numbers (e.g., 45218)  -> parse with unit='D'
-      - Strings in EU format (dd.mm.yyyy, dd/mm/yyyy) -> dayfirst=True
-      - US/ISO strings -> fallback
-    Returns timezone-naive timestamps; unparseable -> NaT.
+    Robustly parse a mixed 'Date' column:
+      - Excel serials (1900 or 1904 epoch auto-detected)
+      - EU strings (dd.mm.yyyy, dd/mm/yyyy, dd-mm-yyyy) -> dayfirst
+      - ISO/US fallbacks
+    Returns tz-naive timestamps; unparseable -> NaT.
     """
     s = series.copy()
 
-    # Identify numeric-looking entries
-    as_num = pd.to_numeric(s, errors="coerce")
-
-    # Heuristic: Excel serials are usually in a sane range (e.g., 1..80000)
-    # We avoid applying the Excel-origin parse to arbitrary numerics.
-    excel_mask = as_num.notna() & (as_num >= 1) & (as_num <= 80000)
-
-    # 1) Start with everything as NaT
+    # Start with NaT
     out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
 
-    # 2) Parse Excel serials (ONLY for the rows in-range). Use unit='D' (uppercase).
-    if excel_mask.any():
-        try:
-            out.loc[excel_mask] = pd.to_datetime(
-                as_num.loc[excel_mask],
-                unit="D",                   # <= uppercase D avoids the "[d]" metadata issue
-                origin="1899-12-30",
-                errors="coerce"
-            )
-        except Exception:
-            # If the environment still complains, just skip this path safely.
-            pass
+    # ---------- 1) Handle numeric-looking (possible Excel serials)
+    as_num = pd.to_numeric(s, errors="coerce")
+    excel_mask = as_num.notna() & (as_num >= 1) & (as_num <= 120000)  # allow wider range
 
-    # 3) Parse non-numeric strings (EU-first, then US/ISO)
+    if excel_mask.any():
+        # Try 1900-system first
+        d1 = pd.to_datetime(as_num.loc[excel_mask], unit="D",
+                            origin="1899-12-30", errors="coerce")
+        # If many dates land pre-1930 (or NaT-heavy), try 1904-system
+        too_old = (d1.dropna() < pd.Timestamp("1930-01-01")).mean() > 0.5
+        many_nat = d1.isna().mean() > 0.5
+        if too_old or many_nat:
+            d1 = pd.to_datetime(as_num.loc[excel_mask], unit="D",
+                                origin="1904-01-01", errors="coerce")
+        out.loc[excel_mask] = d1
+
+    # ---------- 2) Handle strings
     str_mask = ~excel_mask
     s_str = s.loc[str_mask].astype(str).str.strip()
 
-    parsed1 = pd.to_datetime(s_str, errors="coerce", dayfirst=True)
+    # Quick normalization: replace common separators with '-' for parser stability
+    s_norm = (s_str.str.replace(r"[./]", "-", regex=True)
+                    .str.replace(r"\s+.*$", "", regex=True))  # drop trailing time words if any
+
+    # EU-first pass (dayfirst=True)
+    parsed1 = pd.to_datetime(s_norm, errors="coerce", dayfirst=True, infer_datetime_format=True)
     need2 = parsed1.isna()
     if need2.any():
-        parsed2 = pd.to_datetime(s_str[need2], errors="coerce", dayfirst=False)
+        # Fallback pass (ISO/US)
+        parsed2 = pd.to_datetime(s_str[need2], errors="coerce", dayfirst=False, infer_datetime_format=True)
         parsed1.loc[need2] = parsed2
 
     out.loc[str_mask] = parsed1
 
-    # 4) Ensure timezone-naive
+    # ---------- 3) Ensure tz-naive
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
@@ -76,6 +78,7 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
         pass
 
     return out
+
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -276,13 +279,14 @@ def summarize_context(df):
         "top_exp_cat": top_exp_cat,
         "top_rev_cat": top_rev_cat,
         "top5_expenses": (df[df["Type"]=="EXPENSE"]
-                          .assign(Abs=df["Amount"].abs())
-                          .nlargest(5, "Abs")[["Date","Category","Description","Amount"]]
-                          .astype(str).values.tolist()),
+                  .assign(Abs=lambda d: d["Amount"].abs())
+                  .nlargest(5, "Abs")[["Date","Category","Description","Amount"]]
+                  .astype(str).values.tolist()),
         "top5_revenues": (df[df["Type"]=="REVENUE"]
-                          .assign(Abs=df["Amount"].abs())
-                          .nlargest(5, "Abs")[["Date","Category","Description","Amount"]]
-                          .astype(str).values.tolist()),
+                  .assign(Abs=lambda d: d["Amount"].abs())
+                  .nlargest(5, "Abs")[["Date","Category","Description","Amount"]]
+                  .astype(str).values.tolist()),
+
         "date_start": str(df["Date"].min().date()),
         "date_end": str(df["Date"].max().date()),
     }
@@ -765,8 +769,14 @@ if not df.empty:
     exp = df[df["Type"] == "EXPENSE"].copy()
 
     # --- Daily aggregates (abs to avoid sign confusion)
-    daily_rev = rev.groupby(df["Date"].dt.date)["Amount"].apply(lambda s: s.abs().sum()).rename("Revenue")
-    daily_exp = exp.groupby(df["Date"].dt.date)["Amount"].apply(lambda s: s.abs().sum()).rename("Expenses")
+    daily_rev = (rev.groupby(rev["Date"].dt.date)["Amount"]
+               .apply(lambda s: s.abs().sum())
+               .rename("Revenue"))
+
+    daily_exp = (exp.groupby(exp["Date"].dt.date)["Amount"]
+               .apply(lambda s: s.abs().sum())
+               .rename("Expenses"))
+
     daily = pd.concat([daily_rev, daily_exp], axis=1).fillna(0.0)
     daily["Net"] = daily["Revenue"] - daily["Expenses"]
     daily = daily.reset_index().rename(columns={"index": "Day", "Date": "Day"})
@@ -845,3 +855,10 @@ with st.expander("Calculation audit"):
             st.write("**Burn (mean):**", fmt_money(burn_series.mean()))
         else:
             st.write("No expenses in filtered period.")
+    with st.expander("Date parsing diagnostics"):
+    sample = df_raw.head(30).copy()
+    sample["_raw_Date"] = series = sample["Date"]
+    sample["_parsed_Date"] = smart_parse_dates(series)
+    sample["_parsed_Date_str"] = sample["_parsed_Date"].dt.strftime("%Y-%m-%d")
+    st.dataframe(sample[["_raw_Date", "_parsed_Date_str"]])
+
