@@ -26,12 +26,50 @@ EXP_ALIASES = {"EXPENSE", "EXP", "COST", "PURCHASE", "PURCHASES", "SPEND", "SPEN
 # =========================
 # Helpers
 # =========================
+def infer_dayfirst_preference(series: pd.Series, default: bool = True) -> bool:
+    """Infer whether day-first ordering is likely for ambiguous date strings."""
+    if series.empty:
+        return default
+
+    tokens = series.str.extract(r"^\s*(?P<p1>\d{1,4})-(?P<p2>\d{1,2})-(?P<p3>\d{2,4})$")
+    if tokens.empty:
+        return default
+
+    p1 = pd.to_numeric(tokens["p1"], errors="coerce")
+    p2 = pd.to_numeric(tokens["p2"], errors="coerce")
+    mask = p1.notna() & p2.notna()
+    if not mask.any():
+        return default
+
+    p1 = p1[mask]
+    p2 = p2[mask]
+
+    # Focus on plausible day/month tokens (1-31)
+    plaus_mask = (p1 <= 31) & (p2 <= 31)
+    if not plaus_mask.any():
+        return default
+
+    p1 = p1[plaus_mask]
+    p2 = p2[plaus_mask]
+
+    dayfirst_signal = int((p1 > 12).sum())
+    monthfirst_signal = int((p2 > 12).sum())
+
+    if monthfirst_signal > dayfirst_signal:
+        return False
+    if dayfirst_signal > monthfirst_signal:
+        return True
+
+    # Fully ambiguous (all <= 12) – fall back to provided default.
+    return default
+
+
 def smart_parse_dates(series: pd.Series) -> pd.Series:
     """
     Robustly parse a mixed 'Date' column:
       - Excel serials (1900 or 1904 epoch auto-detected)
-      - EU strings (dd.mm.yyyy, dd/mm/yyyy, dd-mm-yyyy) -> dayfirst
-      - ISO fallbacks (preserve day-first semantics)
+      - EU strings (dd.mm.yyyy, dd/mm/yyyy, dd-mm-yyyy) -> auto day/month inference
+      - ISO fallbacks (preserve inferred semantics)
     Returns tz-naive timestamps; unparseable -> NaT.
     """
     s = series.copy()
@@ -69,11 +107,13 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
     s_norm = (s_str.str.replace(r"[./]", "-", regex=True)
                     .str.replace(r"\s+.*$", "", regex=True))  # drop trailing time words if any
 
-    # EU-first pass (dayfirst=True)
+    prefer_dayfirst = infer_dayfirst_preference(s_norm)
+
+    # EU-first pass (auto inferred)
     parsed1 = pd.to_datetime(
         s_norm,
         errors="coerce",
-        dayfirst=True,
+        dayfirst=prefer_dayfirst,
         infer_datetime_format=True,
     )
     need2 = parsed1.isna()
@@ -82,7 +122,7 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
         parsed2 = pd.to_datetime(
             s_str[need2],
             errors="coerce",
-            dayfirst=True,
+            dayfirst=prefer_dayfirst,
             infer_datetime_format=True,
         )
         parsed1.loc[need2] = parsed2
