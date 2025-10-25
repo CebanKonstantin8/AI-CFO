@@ -60,15 +60,48 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
     s_norm = (s_str.str.replace(r"[./]", "-", regex=True)
                     .str.replace(r"\s+.*$", "", regex=True))  # drop trailing time words if any
 
-    # EU-first pass (dayfirst=True)
-    parsed1 = pd.to_datetime(s_norm, errors="coerce", dayfirst=True, infer_datetime_format=True)
-    need2 = parsed1.isna()
-    if need2.any():
-        # Fallback pass (ISO/US)
-        parsed2 = pd.to_datetime(s_str[need2], errors="coerce", dayfirst=False, infer_datetime_format=True)
-        parsed1.loc[need2] = parsed2
+    # Parse with both day-first and month-first assumptions so we can pick the
+    # most plausible interpretation on a per-row basis.  This keeps EU style
+    # (dd/mm) working while still supporting the common US style (mm/dd) for
+    # ambiguous dates such as "03/04/2024".
+    parsed_dayfirst = pd.to_datetime(
+        s_norm,
+        errors="coerce",
+        dayfirst=True,
+        infer_datetime_format=True,
+    )
+    parsed_monthfirst = pd.to_datetime(
+        s_norm,
+        errors="coerce",
+        dayfirst=False,
+        infer_datetime_format=True,
+    )
 
-    out.loc[str_mask] = parsed1
+    # Work out which orientation seems more likely by counting unambiguous
+    # successes for each parser.  When day-first parsing fails but month-first
+    # succeeds (e.g. "11/30/2023"), that is a strong signal that the sheet is
+    # using month-first notation.  Likewise the inverse is a signal for
+    # day-first.  Only fall back to heuristics for the rows where both parses
+    # succeed (ambiguous dd/mm vs mm/dd cases).
+    dayfirst_only = parsed_dayfirst.notna() & parsed_monthfirst.isna()
+    monthfirst_only = parsed_monthfirst.notna() & parsed_dayfirst.isna()
+
+    prefer_monthfirst = monthfirst_only.sum() > dayfirst_only.sum()
+
+    parsed = parsed_dayfirst.copy()
+
+    # Rows where month-first succeeded and day-first failed should use
+    # month-first parsing regardless of the global preference.
+    parsed.loc[monthfirst_only] = parsed_monthfirst.loc[monthfirst_only]
+
+    # For rows where both parsers produced a timestamp, use the orientation
+    # indicated by the dataset-wide preference.  Default to day-first when the
+    # evidence is tied (or absent).
+    ambiguous = parsed_dayfirst.notna() & parsed_monthfirst.notna()
+    if prefer_monthfirst:
+        parsed.loc[ambiguous] = parsed_monthfirst.loc[ambiguous]
+
+    out.loc[str_mask] = parsed
 
     # ---------- 3) Ensure tz-naive
     try:
