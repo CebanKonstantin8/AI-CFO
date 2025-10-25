@@ -199,8 +199,8 @@ df_raw = _load_from_bytes(file_bytes)
 
 
 # Date filters
-min_ts = pd.to_datetime(df_raw["Date"]).min()
-max_ts = pd.to_datetime(df_raw["Date"]).max()
+min_ts = pd.to_datetime(df_raw["Date"], dayfirst=True, errors="coerce").min()
+max_ts = pd.to_datetime(df_raw["Date"], dayfirst=True, errors="coerce").max()
 if pd.isna(min_ts) or pd.isna(max_ts):
     st.error("No valid dates found after parsing.")
     st.stop()
@@ -228,7 +228,7 @@ if selected_types:
     df = df[df["Type"].isin(selected_types)]
 # Create YearMonth once for the filtered frame
 df["YearMonth"] = df["Date"].dt.to_period("M")
-df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
 
 # =========================
 # KPIs
@@ -318,7 +318,7 @@ def _agg_context(df, kpi):
         return {"empty": True}
 
     f = df.copy()
-    f["YearMonth"] = pd.to_datetime(f["Date"], errors="coerce").dt.to_period("M")
+    f["YearMonth"] = pd.to_datetime(f["Date"], errors="coerce", dayfirst=True).dt.to_period("M")
 
     # Category-level aggregation (absolute sums)
     exp_by_cat = (
@@ -367,7 +367,7 @@ def _agg_context(df, kpi):
         f[f["Type"] == "EXPENSE"]
         .assign(Abs=f["Amount"].abs())
         .nlargest(5, "Abs")[["Date", "Category", "Description", "Amount"]]
-        .assign(Date=lambda d: pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d"))
+        .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d"))
         .astype(str)
         .values.tolist()
     )
@@ -375,7 +375,7 @@ def _agg_context(df, kpi):
         f[f["Type"] == "REVENUE"]
         .assign(Abs=f["Amount"].abs())
         .nlargest(5, "Abs")[["Date", "Category", "Description", "Amount"]]
-        .assign(Date=lambda d: pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d"))
+        .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d"))
         .astype(str)
         .values.tolist()
     )
