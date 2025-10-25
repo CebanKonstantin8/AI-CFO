@@ -1522,33 +1522,23 @@ with coly:
             file_name="last10.csv",
             mime="text/csv"
         )
-
-    with col3:
-        top5_exp_csv = (df[df["Type"] == "EXPENSE"]
-                        .assign(Abs=df["Amount"].abs())
-                        .nlargest(5, "Abs")
-                        .drop(columns="Abs"))[["Date", "Category", "Description", "Amount"]]
-        top5_exp_csv_export = top5_exp_csv.copy()
-        top5_exp_csv_export["Date"] = format_dayfirst_series(top5_exp_csv_export["Date"])
-        st.download_button(
-            "Top 5 expenses (CSV)",
-            data=top5_exp_csv_export.to_csv(index=False).encode("utf-8"),
-            file_name="top5_expenses.csv",
-            mime="text/csv"
+        vendor_fig = go.Figure()
+        vendor_fig.add_bar(x=vendor_summary["Vendor"], y=vendor_summary["Spend"], name="Spend")
+        vendor_fig.add_trace(
+            go.Scatter(
+                x=vendor_summary["Vendor"],
+                y=vendor_summary["Cumulative %"],
+                name="Cumulative %",
+                mode="lines+markers",
+                yaxis="y2",
+            )
         )
-
-    with col4:
-        top5_rev_csv = (df[df["Type"] == "REVENUE"]
-                        .assign(Abs=df["Amount"].abs())
-                        .nlargest(5, "Abs")
-                        .drop(columns="Abs"))[["Date", "Category", "Description", "Amount"]]
-        top5_rev_csv_export = top5_rev_csv.copy()
-        top5_rev_csv_export["Date"] = format_dayfirst_series(top5_rev_csv_export["Date"])
-        st.download_button(
-            "Top 5 revenues (CSV)",
-            data=top5_rev_csv_export.to_csv(index=False).encode("utf-8"),
-            file_name="top5_revenues.csv",
-            mime="text/csv"
+        vendor_fig.update_layout(
+            title="Top Vendors by Spend",
+            xaxis_title=None,
+            yaxis_title="Amount",
+            legend_title=None,
+            yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 100]),
         )
 
     with col5:
@@ -1875,6 +1865,141 @@ if not df.empty:
                     )
 else:
     st.info("No rows match your filters. Adjust the date range or Type filter.")
+
+
+st.markdown("### 📥 Download")
+colx, coly = st.columns(2)
+with colx:
+    # JSON transcript download
+    transcript_json = json.dumps(st.session_state.chat, indent=2).encode("utf-8")
+    st.download_button(
+        "Download conversation (JSON)",
+        data=transcript_json,
+        file_name="ai_cfo_conversation.json",
+        mime="application/json",
+    )
+with coly:
+    # Full HTML report (KPIs + charts + transcript)
+    report_bytes = build_report_html()
+    st.download_button(
+        "Download dashboard + conversation (HTML)",
+        data=report_bytes,
+        file_name="ai_cfo_report.html",
+        mime="text/html",
+    )
+    st.markdown("### ⬇️ Data exports")
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    # Current filtered transactions → CSV
+    with col1:
+        tx_export = df.copy()
+        tx_export["Date"] = format_dayfirst_series(tx_export["Date"])
+        st.download_button(
+            "Transactions (CSV)",
+            data=tx_export.to_csv(index=False).encode("utf-8"),
+            file_name="transactions_filtered.csv",
+            mime="text/csv",
+        )
+
+    # Last 10 / Top 5s → CSV
+    with col2:
+        last10_csv = df.sort_values("Date", ascending=False).head(10)[
+            ["Date", "Type", "Category", "Description", "Amount"]
+        ]
+        last10_csv_export = last10_csv.copy()
+        last10_csv_export["Date"] = format_dayfirst_series(last10_csv_export["Date"])
+        st.download_button(
+            "Last 10 (CSV)",
+            data=last10_csv_export.to_csv(index=False).encode("utf-8"),
+            file_name="last10.csv",
+            mime="text/csv",
+        )
+
+    with col3:
+        top5_exp_csv = (
+            df[df["Type"] == "EXPENSE"]
+            .assign(Abs=df["Amount"].abs())
+            .nlargest(5, "Abs")
+            .drop(columns="Abs")
+        )[["Date", "Category", "Description", "Amount"]]
+        top5_exp_csv_export = top5_exp_csv.copy()
+        top5_exp_csv_export["Date"] = format_dayfirst_series(top5_exp_csv_export["Date"])
+        st.download_button(
+            "Top 5 expenses (CSV)",
+            data=top5_exp_csv_export.to_csv(index=False).encode("utf-8"),
+            file_name="top5_expenses.csv",
+            mime="text/csv",
+        )
+
+    with col4:
+        top5_rev_csv = (
+            df[df["Type"] == "REVENUE"]
+            .assign(Abs=df["Amount"].abs())
+            .nlargest(5, "Abs")
+            .drop(columns="Abs")
+        )[["Date", "Category", "Description", "Amount"]]
+        top5_rev_csv_export = top5_rev_csv.copy()
+        top5_rev_csv_export["Date"] = format_dayfirst_series(top5_rev_csv_export["Date"])
+        st.download_button(
+            "Top 5 revenues (CSV)",
+            data=top5_rev_csv_export.to_csv(index=False).encode("utf-8"),
+            file_name="top5_revenues.csv",
+            mime="text/csv",
+        )
+
+    with col5:
+        notes_download = notes_export.copy()
+        if not notes_download.empty:
+            notes_download["Date"] = format_dayfirst_series(notes_download["Date"])
+            notes_download = notes_download[
+                ["Date", "Type", "Category", "Description", "Amount", "Note"]
+            ]
+            notes_data = notes_download.to_csv(index=False).encode("utf-8")
+            disable_notes = False
+        else:
+            notes_data = (
+                pd.DataFrame(
+                    columns=["Date", "Type", "Category", "Description", "Amount", "Note"]
+                )
+                .to_csv(index=False)
+                .encode("utf-8")
+            )
+            disable_notes = True
+        st.download_button(
+            "Notes (CSV)",
+            data=notes_data,
+            file_name="transaction_notes.csv",
+            mime="text/csv",
+            disabled=disable_notes,
+        )
+
+    # Optional XLSX (in-memory) export of the three tables in separate sheets
+    import io
+
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Transactions")
+        last10_csv.to_excel(writer, index=False, sheet_name="Last10")
+        top5_exp_csv.to_excel(writer, index=False, sheet_name="Top5_Expenses")
+        top5_rev_csv.to_excel(writer, index=False, sheet_name="Top5_Revenues")
+        notes_sheet = (
+            notes_export.copy()
+            if not notes_export.empty
+            else pd.DataFrame(
+                columns=["Date", "Type", "Category", "Description", "Amount", "Note"]
+            )
+        )
+        if not notes_sheet.empty:
+            notes_sheet = notes_sheet.copy()
+            notes_sheet["Date"] = format_dayfirst_series(notes_sheet["Date"])
+        notes_sheet.to_excel(writer, index=False, sheet_name="Notes")
+    xlsx_buf.seek(0)
+    st.download_button(
+        "All tables (XLSX)",
+        data=xlsx_buf.getvalue(),
+        file_name="ai_cfo_tables.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 # =========================
