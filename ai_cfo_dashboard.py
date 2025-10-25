@@ -228,6 +228,7 @@ if selected_types:
     df = df[df["Type"].isin(selected_types)]
 # Create YearMonth once for the filtered frame
 df["YearMonth"] = df["Date"].dt.to_period("M")
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
 # =========================
 # KPIs
@@ -541,7 +542,8 @@ def df_to_html(df, cols, title):
         return f"<h3>{title}</h3><p>No rows.</p>"
     df2 = df.copy()
     if "Date" in df2.columns:
-        df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d")
+
     if "Amount" in df2.columns:
         df2["Amount"] = df2["Amount"].map(_moneyfmt)
     html = df2[cols].to_html(index=False, escape=False)
@@ -730,7 +732,7 @@ with t1:
     if not kpi["last10"].empty:
         st.dataframe(
             kpi["last10"][["Date", "Type", "Category", "Description", "Amount"]]
-            .assign(Date=lambda d: pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d")),
+            .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d")),
             use_container_width=True,
             height=360
         )
@@ -741,7 +743,7 @@ with t2:
     if not kpi["top5_exp"].empty:
         st.dataframe(
             kpi["top5_exp"][["Date", "Category", "Description", "Amount"]]
-            .assign(Date=lambda d: pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d")),
+            .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d")),
             use_container_width=True,
             height=180
         )
@@ -751,7 +753,7 @@ with t2:
     if not kpi["top5_rev"].empty:
         st.dataframe(
             kpi["top5_rev"][["Date", "Category", "Description", "Amount"]]
-            .assign(Date=lambda d: pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d")),
+            .assign(Date=lambda d: pd.to_datetime(d["Date"], dayfirst=True).dt.strftime("%Y-%m-%d")),
             use_container_width=True,
             height=180
         )
