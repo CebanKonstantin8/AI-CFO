@@ -3,13 +3,22 @@
 # Expects a sheet named "transaction" with columns:
 # Date | Type | Category | Description | Amount
 
+import base64
 import datetime as dt
 import io
+import json
+import os
+import re
+import urllib.parse
+from typing import Dict, Iterable, Optional
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import streamlit as st
+from openai import OpenAI
 
 st.set_page_config(page_title="AI CFO — Dashboard", layout="wide")
 
@@ -205,6 +214,375 @@ def load_excel(file: io.BytesIO) -> pd.DataFrame:
     df["__used_exact_tx_sheet__"] = is_exact
     return df
 
+
+def build_cash_bridge(df: pd.DataFrame, start: dt.date, end: dt.date) -> Optional[go.Figure]:
+    """Return a Waterfall showing revenue, expenses, and net change."""
+    if df.empty:
+        return None
+
+    revenue = float(df.loc[df["Type"] == "REVENUE", "Amount"].abs().sum())
+    expenses = float(df.loc[df["Type"] == "EXPENSE", "Amount"].abs().sum())
+    if revenue == 0 and expenses == 0:
+        return None
+
+    net = revenue - expenses
+    labels = ["Revenue", "Expenses", "Net change"]
+    values = [revenue, -expenses, net]
+    texts = [fmt_money(v) for v in values]
+
+    fig = go.Figure(
+        go.Waterfall(
+            name="Cash bridge",
+            orientation="v",
+            measure=["relative", "relative", "total"],
+            x=labels,
+            y=values,
+            text=texts,
+            textposition="outside",
+            connector={"line": {"color": "#666"}},
+        )
+    )
+    fig.update_layout(
+        title=f"Cash Bridge ({format_dayfirst_scalar(start)} → {format_dayfirst_scalar(end)})",
+        showlegend=False,
+        yaxis_title="Amount",
+    )
+    return fig
+
+
+def build_budget_variance(df: pd.DataFrame, budgets: Dict[str, float]) -> Optional[pd.DataFrame]:
+    """Return a DataFrame comparing actual vs budget for the supplied categories."""
+    if df.empty or not budgets:
+        return None
+
+    actual = (
+        df.assign(Abs=lambda d: d["Amount"].abs())
+        .groupby("Category")["Abs"]
+        .sum()
+    )
+    rows = []
+    for category, budget in budgets.items():
+        if budget is None:
+            continue
+        actual_val = float(actual.get(category, 0.0))
+        rows.append(
+            {
+                "Category": category,
+                "Actual": actual_val,
+                "Budget": float(budget),
+                "Variance": actual_val - float(budget),
+            }
+        )
+
+    if not rows:
+        return None
+
+    result = pd.DataFrame(rows).set_index("Category")
+    return result.sort_values("Variance", ascending=False)
+
+
+def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag category-month spikes using a simple z-score threshold."""
+    if df.empty:
+        return pd.DataFrame(columns=["Category", "Month", "Spend", "Z-Score"])
+
+    monthly = (
+        df.assign(Abs=lambda d: d["Amount"].abs(), Month=df["Date"].dt.to_period("M"))
+        .groupby(["Category", "Month"], as_index=False)["Abs"]
+        .sum()
+        .rename(columns={"Abs": "Spend"})
+    )
+    if monthly.empty:
+        return pd.DataFrame(columns=["Category", "Month", "Spend", "Z-Score"])
+
+    monthly["Mean"] = monthly.groupby("Category")["Spend"].transform("mean")
+    monthly["Std"] = monthly.groupby("Category")["Spend"].transform("std")
+    monthly["Std"] = monthly["Std"].replace(0, np.nan)
+    monthly["Z-Score"] = (monthly["Spend"] - monthly["Mean"]) / monthly["Std"]
+    flagged = monthly[monthly["Z-Score"].abs() >= 2].copy()
+    if flagged.empty:
+        return pd.DataFrame(columns=["Category", "Month", "Spend", "Z-Score"])
+
+    flagged["Month"] = format_month_period(flagged["Month"])
+    flagged["Spend"] = flagged["Spend"].map(float)
+    return flagged[["Category", "Month", "Spend", "Z-Score"]].sort_values(
+        ["Z-Score"], ascending=False
+    )
+
+
+def compute_daily_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate revenue and expenses per day for the filtered frame."""
+    if df.empty:
+        return pd.DataFrame(columns=["Day", "Revenue", "Expenses", "Net"])
+
+    daily_rev = (
+        df[df["Type"] == "REVENUE"].groupby(df["Date"].dt.date)["Amount"].apply(lambda s: s.abs().sum())
+    )
+    daily_exp = (
+        df[df["Type"] == "EXPENSE"].groupby(df["Date"].dt.date)["Amount"].apply(lambda s: s.abs().sum())
+    )
+    daily = pd.concat([daily_rev.rename("Revenue"), daily_exp.rename("Expenses")], axis=1).fillna(0.0)
+    daily["Net"] = daily["Revenue"] - daily["Expenses"]
+    daily = daily.reset_index().rename(columns={"index": "Day", "Date": "Day"})
+    daily["Day"] = pd.to_datetime(daily["Day"], errors="coerce", dayfirst=True)
+    return daily.dropna(subset=["Day"]).sort_values("Day")
+
+
+def compute_monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate revenue and expenses per calendar month."""
+    if df.empty:
+        return pd.DataFrame(columns=["YearMonth", "Revenue", "Expenses"])
+
+    monthly_rev = (
+        df[df["Type"] == "REVENUE"]
+        .assign(Abs=lambda d: d["Amount"].abs(), YearMonth=lambda d: d["Date"].dt.to_period("M"))
+        .groupby("YearMonth", as_index=False)["Abs"].sum()
+        .rename(columns={"Abs": "Revenue"})
+    )
+    monthly_exp = (
+        df[df["Type"] == "EXPENSE"]
+        .assign(Abs=lambda d: d["Amount"].abs(), YearMonth=lambda d: d["Date"].dt.to_period("M"))
+        .groupby("YearMonth", as_index=False)["Abs"].sum()
+        .rename(columns={"Abs": "Expenses"})
+    )
+    monthly = pd.merge(monthly_rev, monthly_exp, on="YearMonth", how="outer").fillna(0.0)
+    return monthly.sort_values("YearMonth")
+
+
+@st.cache_data(show_spinner=False)
+def load_vendor_rules_csv(data: bytes) -> Optional[pd.DataFrame]:
+    """Load optional vendor rules with pattern/vendor columns."""
+    if not data:
+        return None
+    try:
+        rules = pd.read_csv(io.BytesIO(data))
+    except Exception:
+        return None
+    expected = {"pattern", "vendor"}
+    if not expected.issubset({c.strip().lower() for c in rules.columns}):
+        return None
+    rename = {}
+    for col in rules.columns:
+        lower = col.strip().lower()
+        if lower in expected:
+            rename[col] = lower
+    rules = rules.rename(columns=rename)
+    rules = rules[["pattern", "vendor"]].dropna()
+    return rules
+
+
+def apply_vendor_rules(df: pd.DataFrame, rules: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Annotate the Description column with vendor names based on regex/substrings."""
+    if df.empty or rules is None or rules.empty:
+        return df
+
+    compiled = []
+    for _, row in rules.iterrows():
+        pattern = str(row["pattern"]).strip()
+        vendor = str(row["vendor"]).strip()
+        if not pattern or not vendor:
+            continue
+        try:
+            compiled.append((re.compile(pattern, flags=re.IGNORECASE), vendor))
+        except re.error:
+            compiled.append((re.compile(re.escape(pattern), flags=re.IGNORECASE), vendor))
+
+    if not compiled:
+        return df
+
+    vendors = []
+    for desc in df["Description"].astype(str):
+        vendor_label = ""
+        for pattern, vendor in compiled:
+            if pattern.search(desc):
+                vendor_label = vendor
+                break
+        vendors.append(vendor_label)
+
+    df = df.copy()
+    df["Vendor"] = vendors
+    return df
+
+
+def top_vendors_by_spend(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
+    """Return top vendors by absolute spend."""
+    if df.empty or "Vendor" not in df.columns:
+        return pd.DataFrame(columns=["Vendor", "Spend"])
+
+    spend = (
+        df[df["Vendor"].astype(str) != ""]
+        .assign(Abs=lambda d: d["Amount"].abs())
+        .groupby("Vendor", as_index=False)["Abs"].sum()
+        .rename(columns={"Abs": "Spend"})
+        .sort_values("Spend", ascending=False)
+        .head(limit)
+    )
+    return spend
+
+
+def _budget_widget_key(category: str) -> str:
+    """Generate a stable widget key for category budgets."""
+    safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(category)).strip("_")
+    safe = safe or "category"
+    return f"budget_{safe.lower()}"
+
+
+def compute_13_week_forecast(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Create a naive 13-week forward forecast using trailing averages."""
+    daily = compute_daily_summary(df)
+    if daily.empty:
+        return None
+
+    forecast_days = 13 * 7
+    history_window = min(56, len(daily))
+    recent = daily.tail(history_window)
+    revenue_avg = float(recent["Revenue"].mean()) if not recent.empty else 0.0
+    expenses_avg = float(recent["Expenses"].mean()) if not recent.empty else 0.0
+
+    last_day = daily["Day"].max()
+    future_index = pd.date_range(last_day + pd.Timedelta(days=1), periods=forecast_days, freq="D")
+    forecast = pd.DataFrame(
+        {
+            "Day": future_index,
+            "Revenue": revenue_avg,
+            "Expenses": expenses_avg,
+        }
+    )
+    forecast["Net"] = forecast["Revenue"] - forecast["Expenses"]
+
+    daily = pd.concat([daily, forecast], ignore_index=True)
+    daily["is_forecast"] = daily["Day"] > last_day
+    return daily
+
+
+def build_forecast_chart(forecast_df: pd.DataFrame) -> Optional[go.Figure]:
+    """Plot historical vs forward forecast with shading."""
+    if forecast_df is None or forecast_df.empty:
+        return None
+
+    fig = go.Figure()
+    hist = forecast_df[~forecast_df["is_forecast"]]
+    fut = forecast_df[forecast_df["is_forecast"]]
+
+    for name, color in [("Revenue", "#2ca02c"), ("Expenses", "#d62728")] :
+        fig.add_trace(
+            go.Scatter(
+                x=hist["Day"],
+                y=hist[name],
+                name=f"Historical {name}",
+                mode="lines",
+                line=dict(color=color),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=fut["Day"],
+                y=fut[name],
+                name=f"Forecast {name}",
+                mode="lines",
+                line=dict(color=color, dash="dash"),
+                showlegend=True,
+            )
+        )
+
+    if not fut.empty:
+        fig.add_vrect(
+            x0=fut["Day"].min(),
+            x1=fut["Day"].max(),
+            fillcolor="#f0f4ff",
+            opacity=0.2,
+            line_width=0,
+            annotation_text="Forecast",
+            annotation_position="top left",
+        )
+
+    fig.update_layout(
+        title="13-Week Cash Forecast",
+        xaxis_title=None,
+        yaxis_title="Amount",
+        legend_title=None,
+    )
+    fig.update_xaxes(tickformat="%d/%m/%Y")
+    return fig
+
+
+def build_dcf_sensitivity(
+    df: pd.DataFrame,
+    projection_years: int,
+    revenue_growth: float,
+    expense_growth: float,
+    base_wacc: float,
+    terminal_growth: float,
+) -> Optional[Dict[str, object]]:
+    """Create a heatmap of NPV sensitivity over WACC and terminal growth ranges."""
+    if df.empty:
+        return None
+
+    wacc_values = np.linspace(max(base_wacc - 0.04, 0.001), base_wacc + 0.04, 9)
+    terminal_values = np.linspace(terminal_growth - 0.02, terminal_growth + 0.02, 9)
+
+    heat = []
+    for tg in terminal_values:
+        row = []
+        for w in wacc_values:
+            scenario = compute_dcf_projection(
+                df,
+                wacc=max(w, 0.0001),
+                projection_years=projection_years,
+                revenue_growth=revenue_growth,
+                expense_growth=expense_growth,
+                terminal_growth=tg,
+            )
+            row.append(np.nan if scenario is None else float(scenario.get("npv", np.nan)))
+        heat.append(row)
+
+    heat = np.array(heat)
+    if np.all(np.isnan(heat)):
+        return None
+
+    x_labels = [f"{v*100:.1f}%" for v in wacc_values]
+    y_labels = [f"{v*100:.1f}%" for v in terminal_values]
+    fig = px.imshow(
+        heat,
+        x=x_labels,
+        y=y_labels,
+        labels=dict(x="WACC", y="Terminal growth", color="NPV"),
+        text_auto=".2f",
+    )
+    fig.update_layout(
+        title="DCF Sensitivity (NPV)",
+        xaxis_title="WACC",
+        yaxis_title="Terminal growth",
+        coloraxis_colorbar=dict(title="NPV"),
+    )
+    return {
+        "figure": fig,
+        "wacc_range": (wacc_values.min(), wacc_values.max()),
+        "terminal_range": (terminal_values.min(), terminal_values.max()),
+    }
+
+
+def build_shareable_link(
+    start: dt.date,
+    end: dt.date,
+    selected_types: Iterable[str],
+    rev_target: float,
+    exp_target: float,
+    mode: str,
+) -> str:
+    """Set query params for the current filters and return a relative shareable link."""
+    params = {
+        "start": [pd.to_datetime(start).strftime("%Y-%m-%d")] if start else [],
+        "end": [pd.to_datetime(end).strftime("%Y-%m-%d")] if end else [],
+        "types": [",".join(sorted(set(selected_types)))],
+        "rev_target": [f"{rev_target:.2f}"],
+        "exp_target": [f"{exp_target:.2f}"],
+        "mode": [mode],
+    }
+    st.experimental_set_query_params(**{k: v for k, v in params.items() if v})
+    query = urllib.parse.urlencode({k: v[0] for k, v in params.items() if v})
+    return f"?{query}" if query else ""
+
 def kpis_from_filtered(df: pd.DataFrame) -> dict:
     """Compute main metrics: revenue, expenses, cash, burn rate, runway, tables."""
     rev_mask = df["Type"] == "REVENUE"
@@ -359,6 +737,7 @@ def _load_from_bytes(b: bytes):
 
 file_bytes = uploaded.getvalue()          # <-- bytes change for each file
 df_raw = _load_from_bytes(file_bytes)
+df_raw["__row_id__"] = np.arange(len(df_raw))
 
 
 # Date filters
@@ -371,11 +750,37 @@ if pd.isna(min_ts) or pd.isna(max_ts):
 min_d = min_ts.date()
 max_d = max_ts.date()
 default_range = (min_d, max_d) if min_d <= max_d else (max_d, min_d)
+query_params = st.experimental_get_query_params()
+start_override = query_params.get("start", [None])[0]
+end_override = query_params.get("end", [None])[0]
+date_override = None
+if start_override and end_override:
+    try:
+        parsed_start = pd.to_datetime(start_override, errors="coerce", dayfirst=True)
+        parsed_end = pd.to_datetime(end_override, errors="coerce", dayfirst=True)
+        if pd.notna(parsed_start) and pd.notna(parsed_end):
+            date_override = (parsed_start.date(), parsed_end.date())
+    except Exception:
+        date_override = None
+
+type_options = ["REVENUE", "EXPENSE"]
+type_override = []
+if "types" in query_params:
+    raw_types: Iterable[str] = query_params.get("types", [])
+    for entry in raw_types:
+        for token in str(entry).split(","):
+            token = token.strip().upper()
+            if token in type_options and token not in type_override:
+                type_override.append(token)
+
+rev_target_default = float(query_params.get("rev_target", [0.0])[0] or 0.0)
+mode_override = query_params.get("mode", [None])[0] or None
+exp_target_default = float(query_params.get("exp_target", [0.0])[0] or 0.0)
 
 st.sidebar.header("Filters")
 date_range = st.sidebar.date_input(
     "Date range",
-    value=default_range,
+    value=date_override or default_range,
     min_value=min_d,
     max_value=max_d,
     format="DD/MM/YYYY",
@@ -385,23 +790,26 @@ if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
 else:
     start_date, end_date = default_range
 
-type_options = ["REVENUE", "EXPENSE"]
-selected_types = st.sidebar.multiselect("Type", options=type_options, default=type_options)
+selected_types = st.sidebar.multiselect(
+    "Type",
+    options=type_options,
+    default=type_override or type_options,
+)
 
 st.sidebar.header("Targets")
 rev_target = st.sidebar.number_input(
     "Revenue target",
     min_value=0.0,
-    value=0.0,
+    value=float(rev_target_default),
     step=1000.0,
-    help="Target revenue for the currently selected period."
+    help="Target revenue for the currently selected period.",
 )
 exp_target = st.sidebar.number_input(
     "Expenses target",
     min_value=0.0,
-    value=0.0,
+    value=float(exp_target_default),
     step=1000.0,
-    help="Target expenses for the currently selected period."
+    help="Target expenses for the currently selected period.",
 )
 
 st.sidebar.header("DCF Model Inputs")
@@ -438,6 +846,17 @@ wacc_pct = st.sidebar.number_input(
     help="Weighted Average Cost of Capital used to discount future cash flows.",
 )
 
+vendor_rules_file = st.sidebar.file_uploader(
+    "Vendor rules CSV",
+    type=["csv"],
+    help="Optional mapping with columns pattern,vendor (substring or regex to vendor name).",
+)
+vendor_rules = None
+if vendor_rules_file is not None:
+    vendor_rules = load_vendor_rules_csv(vendor_rules_file.getvalue())
+    if vendor_rules is None:
+        st.sidebar.info("Could not parse vendor rules. Expected columns: pattern, vendor.")
+
 # =========================
 # Apply Filters
 # =========================
@@ -448,6 +867,25 @@ if selected_types:
 # Create YearMonth once for the filtered frame
 df["YearMonth"] = df["Date"].dt.to_period("M")
 df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+
+if vendor_rules is not None:
+    df = apply_vendor_rules(df, vendor_rules)
+
+budget_categories = sorted(df["Category"].dropna().unique())[:20]
+budgets: Dict[str, float] = {}
+if budget_categories:
+    st.sidebar.header("Budgets (this period)")
+    for cat in budget_categories:
+        widget_key = _budget_widget_key(cat)
+        budgets[cat] = st.sidebar.number_input(
+            f"Budget: {cat}",
+            min_value=0.0,
+            value=float(st.session_state.get(widget_key, 0.0)),
+            step=500.0,
+            key=widget_key,
+        )
+else:
+    budgets = {}
 
 # =========================
 # KPIs
@@ -475,12 +913,82 @@ col5.metric(
     delta_color="normal"
 )
 
+if np.isfinite(kpi["runway"]) and kpi["runway"] < 6:
+    st.toast(
+        f"Runway alert: only {fmt_runway(kpi['runway'])} remaining based on current burn.",
+        icon="⚠️",
+    )
+if exp_target > 0 and kpi["expenses"] > exp_target:
+    st.toast(
+        f"Expenses exceed target by {fmt_money(kpi['expenses'] - exp_target)}.",
+        icon="🔥",
+    )
+if rev_target > 0 and kpi["revenue"] < rev_target:
+    st.toast(
+        f"Revenue is below target by {fmt_money(rev_target - kpi['revenue'])}.",
+        icon="⚠️",
+    )
+
+budget_fig = None
+budget_variance = build_budget_variance(df, budgets)
+if budget_variance is not None and not budget_variance.empty:
+    st.subheader("Budget vs Actuals by Category")
+    budget_display = budget_variance.reset_index()
+    budget_fig = px.bar(
+        budget_display,
+        x="Category",
+        y=["Actual", "Budget"],
+        barmode="group",
+        title="Budget vs Actuals",
+    )
+    budget_fig.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
+    st.plotly_chart(budget_fig, use_container_width=True, theme="streamlit")
+    variance_table = budget_display.assign(
+        Actual=budget_display["Actual"].map(fmt_money),
+        Budget=budget_display["Budget"].map(fmt_money),
+        Variance=budget_display["Variance"].map(fmt_money),
+    )
+    st.dataframe(variance_table.sort_values("Variance", ascending=False), use_container_width=True)
+else:
+    budget_variance = None
+
+anomalies_df = detect_anomalies(df)
+if not anomalies_df.empty:
+    st.toast(
+        f"Detected {len(anomalies_df)} category-month anomalies (|z| ≥ 2).",
+        icon="🚨",
+    )
+    st.subheader("Anomaly & Spike Detection")
+    anomalies_display = anomalies_df.copy()
+    anomalies_display["Spend"] = anomalies_display["Spend"].map(fmt_money)
+    anomalies_display["Z-Score"] = anomalies_display["Z-Score"].map(lambda v: f"{v:.2f}")
+    st.dataframe(anomalies_display, use_container_width=True)
+else:
+    anomalies_df = pd.DataFrame(columns=["Category", "Month", "Spend", "Z-Score"])
+
+share_col = st.columns([1, 3])[0]
+if "shareable_link" not in st.session_state:
+    st.session_state.shareable_link = ""
+if share_col.button("Copy Shareable Link"):
+    share_link = build_shareable_link(
+        start_date,
+        end_date,
+        selected_types,
+        rev_target,
+        exp_target,
+        st.session_state.get("cfo_mode", mode_override or "Strategic"),
+    )
+    st.session_state.shareable_link = share_link
+if st.session_state.shareable_link:
+    st.text_input("Shareable link", st.session_state.shareable_link, key="shareable_link_display", disabled=True)
+
 rev_growth = rev_growth_pct / 100.0
 exp_growth = exp_growth_pct / 100.0
 terminal_growth = terminal_growth_pct / 100.0
 wacc = wacc_pct / 100.0
 
 st.markdown("### 💰 Discounted Cash Flow (DCF) Valuation")
+dcf_sensitivity_fig = None
 dcf = compute_dcf_projection(
     df,
     wacc=wacc,
@@ -518,6 +1026,28 @@ else:
         schedule_display,
         use_container_width=True,
     )
+
+    sensitivity = build_dcf_sensitivity(
+        df,
+        projection_years=projection_years,
+        revenue_growth=rev_growth,
+        expense_growth=exp_growth,
+        base_wacc=wacc,
+        terminal_growth=terminal_growth,
+    )
+    if sensitivity:
+        dcf_sensitivity_fig = sensitivity["figure"]
+        st.plotly_chart(dcf_sensitivity_fig, use_container_width=True, theme="streamlit")
+        st.caption(
+            "Sensitivity ranges — WACC {:.1f}% to {:.1f}% • Terminal growth {:.1f}% to {:.1f}%".format(
+                sensitivity["wacc_range"][0] * 100,
+                sensitivity["wacc_range"][1] * 100,
+                sensitivity["terminal_range"][0] * 100,
+                sensitivity["terminal_range"][1] * 100,
+            )
+        )
+    else:
+        dcf_sensitivity_fig = None
 
     if dcf.get("terminal_value") is not None:
         st.caption(
@@ -579,11 +1109,6 @@ def summarize_context(df):
 
 st.markdown("---")
 # --- AI CFO: tightly grounded, 100-word max, no outside info ---
-from openai import OpenAI
-import os, io, base64, json, datetime as dt
-import plotly.io as pio
-import streamlit as st
-from openai import OpenAI
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -591,8 +1116,6 @@ if not OPENAI_API_KEY:
     st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-import pandas as pd
-import numpy as np
 
 def _agg_context(df, kpi, revenue_target=None, expense_target=None):
     """
@@ -803,12 +1326,14 @@ st.markdown("### 💬 Converse with your AI CFO")
 # Persist user preferences
 if "cfo_tone" not in st.session_state: st.session_state.cfo_tone = "direct"
 if "cfo_length" not in st.session_state: st.session_state.cfo_length = "medium"
-if "cfo_mode" not in st.session_state: st.session_state.cfo_mode = "Strategic"
+if "cfo_mode" not in st.session_state: st.session_state.cfo_mode = mode_override or "Strategic"
 
 colA, colB, colC = st.columns(3)
 st.session_state.cfo_tone = colA.selectbox("Tone", ["direct","supportive","challenging"], index=0)
 st.session_state.cfo_length = colB.selectbox("Length", ["short","medium","long"], index=1)
-st.session_state.cfo_mode = colC.radio("Conversation type", ["Strategic","Tactical","Urgent"], index=0)
+mode_options = ["Strategic", "Tactical", "Urgent"]
+mode_index = mode_options.index(st.session_state.cfo_mode) if st.session_state.cfo_mode in mode_options else 0
+st.session_state.cfo_mode = colC.radio("Conversation type", mode_options, index=mode_index)
 
 # Conversation store
 if "chat" not in st.session_state: st.session_state.chat = []  # [{role, content, ts}]
@@ -876,6 +1401,10 @@ def build_report_html() -> bytes:
 
     # Charts → base64 (ignore if missing)
     charts_html = ""
+    try:
+        charts_html += f'<img alt="Cash Bridge" style="max-width:100%" src="data:image/png;base64,{fig_to_b64(cash_bridge_fig)}" />'
+    except Exception:
+        charts_html += "<p>Cash bridge unavailable.</p>"
     try:
         charts_html += f'<img alt="Daily Net" style="max-width:100%" src="data:image/png;base64,{fig_to_b64(fig)}" />'
     except Exception:
@@ -968,7 +1497,7 @@ with coly:
     st.download_button("Download dashboard + conversation (HTML)", data=report_bytes,
                        file_name="ai_cfo_report.html", mime="text/html")
     st.markdown("### ⬇️ Data exports")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     # Current filtered transactions → CSV
     with col1:
@@ -1022,6 +1551,24 @@ with coly:
             mime="text/csv"
         )
 
+    with col5:
+        notes_download = notes_export.copy()
+        if not notes_download.empty:
+            notes_download["Date"] = format_dayfirst_series(notes_download["Date"])
+            notes_download = notes_download[["Date", "Type", "Category", "Description", "Amount", "Note"]]
+            notes_data = notes_download.to_csv(index=False).encode("utf-8")
+            disable_notes = False
+        else:
+            notes_data = pd.DataFrame(columns=["Date", "Type", "Category", "Description", "Amount", "Note"]).to_csv(index=False).encode("utf-8")
+            disable_notes = True
+        st.download_button(
+            "Notes (CSV)",
+            data=notes_data,
+            file_name="transaction_notes.csv",
+            mime="text/csv",
+            disabled=disable_notes
+        )
+
     # Optional XLSX (in-memory) export of the three tables in separate sheets
     import io
 
@@ -1031,6 +1578,11 @@ with coly:
         last10_csv.to_excel(writer, index=False, sheet_name="Last10")
         top5_exp_csv.to_excel(writer, index=False, sheet_name="Top5_Expenses")
         top5_rev_csv.to_excel(writer, index=False, sheet_name="Top5_Revenues")
+        notes_sheet = notes_export.copy() if not notes_export.empty else pd.DataFrame(columns=["Date", "Type", "Category", "Description", "Amount", "Note"])
+        if not notes_sheet.empty:
+            notes_sheet = notes_sheet.copy()
+            notes_sheet["Date"] = format_dayfirst_series(notes_sheet["Date"])
+        notes_sheet.to_excel(writer, index=False, sheet_name="Notes")
     xlsx_buf.seek(0)
     st.download_button(
         "All tables (XLSX)",
@@ -1038,6 +1590,44 @@ with coly:
         file_name="ai_cfo_tables.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+if vendor_rules is not None and "Vendor" in df.columns:
+    vendor_summary = top_vendors_by_spend(df)
+    if vendor_summary is not None and not vendor_summary.empty:
+        st.subheader("Top Vendors by Spend")
+        vendor_summary = vendor_summary.assign(
+            **{
+                "Cumulative %": (vendor_summary["Spend"].cumsum() / vendor_summary["Spend"].sum()) * 100,
+                "Spend": vendor_summary["Spend"].astype(float),
+            }
+        )
+        vendor_fig = go.Figure()
+        vendor_fig.add_bar(x=vendor_summary["Vendor"], y=vendor_summary["Spend"], name="Spend")
+        vendor_fig.add_trace(
+            go.Scatter(
+                x=vendor_summary["Vendor"],
+                y=vendor_summary["Cumulative %"],
+                name="Cumulative %",
+                mode="lines+markers",
+                yaxis="y2",
+            )
+        )
+        vendor_fig.update_layout(
+            title="Top Vendors by Spend",
+            xaxis_title=None,
+            yaxis_title="Amount",
+            legend_title=None,
+            yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 100]),
+        )
+        st.plotly_chart(vendor_fig, use_container_width=True, theme="streamlit")
+        vendor_display = vendor_summary.copy()
+        vendor_display["Spend"] = vendor_display["Spend"].map(fmt_money)
+        vendor_display["Cumulative %"] = vendor_display["Cumulative %"].map(lambda v: f"{v:.1f}%")
+        st.dataframe(vendor_display, use_container_width=True)
+    else:
+        st.info("No vendor matches found with the provided rules.")
+elif vendor_rules_file is not None:
+    st.info("Vendor rules supplied but no matches detected in the filtered data.")
 
 # =========================
 # Tables
@@ -1076,170 +1666,213 @@ with t2:
     else:
         st.write("No revenues in range.")
 
+notes_section = df.sort_values("Date", ascending=False).head(200).copy()
+if "transaction_notes" not in st.session_state:
+    st.session_state.transaction_notes = {}
+notes_map = st.session_state.transaction_notes
+if notes_map:
+    pinned = df[df["__row_id__"].isin(notes_map.keys())]
+    if not pinned.empty:
+        notes_section = pd.concat([notes_section, pinned]).drop_duplicates("__row_id__", keep="first")
+        notes_section = notes_section.sort_values("Date", ascending=False)
+if not notes_section.empty:
+    st.subheader("Notes & Decisions Log")
+    editable = notes_section[["__row_id__", "Date", "Type", "Category", "Description", "Amount"]].copy()
+    editable["Date"] = editable["Date"].dt.strftime(DATE_DISPLAY_FMT)
+    editable["Amount"] = editable["Amount"].map(fmt_money)
+    editable["Note"] = editable["__row_id__"].map(notes_map).fillna("")
+    column_config = {
+        "__row_id__": st.column_config.Column("Row ID", disabled=True),
+        "Date": st.column_config.Column("Date", disabled=True),
+        "Type": st.column_config.Column("Type", disabled=True),
+        "Category": st.column_config.Column("Category", disabled=True),
+        "Description": st.column_config.Column("Description", disabled=True),
+        "Amount": st.column_config.Column("Amount", disabled=True),
+    }
+    edited = st.data_editor(
+        editable,
+        key="notes_editor",
+        hide_index=True,
+        column_config=column_config,
+    )
+    if edited is not None:
+        for _, row in edited.iterrows():
+            note_val = row.get("Note", "").strip()
+            rid = row["__row_id__"]
+            if note_val:
+                notes_map[rid] = note_val
+            elif rid in notes_map:
+                del notes_map[rid]
+    notes_export = df[df["__row_id__"].isin(notes_map.keys())].copy()
+    notes_export["Note"] = notes_export["__row_id__"].map(notes_map)
+    notes_export = notes_export.drop(columns=["__row_id__"], errors="ignore")[["Date", "Type", "Category", "Description", "Amount", "Note"]]
+else:
+    notes_export = pd.DataFrame(columns=["Date", "Type", "Category", "Description", "Amount", "Note"])
 
 # =========================
 # Charts
 # =========================
 st.subheader("Trends")
 
+fig = None
+fig2 = None
+cash_bridge_fig = None
+forecast_fig = None
+
 if not df.empty:
-    rev = df[df["Type"] == "REVENUE"].copy()
-    exp = df[df["Type"] == "EXPENSE"].copy()
+    cash_bridge_fig = build_cash_bridge(df, start_date, end_date)
+    if cash_bridge_fig is not None:
+        st.plotly_chart(cash_bridge_fig, use_container_width=True, theme="streamlit")
 
-    # --- Daily aggregates (abs to avoid sign confusion)
-    daily_rev = (rev.groupby(rev["Date"].dt.date)["Amount"]
-               .apply(lambda s: s.abs().sum())
-               .rename("Revenue"))
-
-    daily_exp = (exp.groupby(exp["Date"].dt.date)["Amount"]
-               .apply(lambda s: s.abs().sum())
-               .rename("Expenses"))
-
-    daily = pd.concat([daily_rev, daily_exp], axis=1).fillna(0.0)
-    daily["Net"] = daily["Revenue"] - daily["Expenses"]
-    daily = daily.reset_index().rename(columns={"index": "Day", "Date": "Day"})
-    daily["Day"] = pd.to_datetime(daily["Day"], dayfirst=True)
+    daily = compute_daily_summary(df)
+    monthly = compute_monthly_summary(df)
 
     tab1, tab2 = st.tabs(["Daily Net", "Monthly Revenue vs Expenses"])
 
     with tab1:
-        daily_sorted = daily.sort_values("Day").dropna(subset=["Day"])
-        fig = px.line(
-            daily_sorted,
-            x="Day", y=["Revenue", "Expenses", "Net"],
-            title="Daily Revenue / Expenses / Net"
-        )
-        fig.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
-        fig.update_xaxes(tickformat="%d/%m/%Y")
+        if daily.empty:
+            st.info("Not enough daily data to chart.")
+        else:
+            daily_sorted = daily.sort_values("Day")
+            fig = px.line(
+                daily_sorted,
+                x="Day",
+                y=["Revenue", "Expenses", "Net"],
+                title="Daily Revenue / Expenses / Net",
+            )
+            fig.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
+            fig.update_xaxes(tickformat="%d/%m/%Y")
 
-        color_lookup = {trace.name: trace.line.color for trace in fig.data}
-        ordinal_days = daily_sorted["Day"].map(pd.Timestamp.toordinal).to_numpy()
-        avg_positions = {"Revenue": "top left", "Expenses": "top right", "Net": "bottom left"}
+            color_lookup = {trace.name: trace.line.color for trace in fig.data}
+            ordinal_days = daily_sorted["Day"].map(pd.Timestamp.toordinal).to_numpy()
+            avg_positions = {"Revenue": "top left", "Expenses": "top right", "Net": "bottom left"}
 
-        for metric in ["Revenue", "Expenses", "Net"]:
-            if metric not in daily_sorted.columns or len(daily_sorted) < 2:
-                continue
-            y_vals = daily_sorted[metric].to_numpy(dtype=float)
-            if not np.isfinite(y_vals).any() or np.unique(ordinal_days).size < 2:
-                continue
-            coeffs = np.polyfit(ordinal_days, y_vals, 1)
-            trend = coeffs[0] * ordinal_days + coeffs[1]
-            fig.add_trace(
-                go.Scatter(
-                    x=daily_sorted["Day"],
-                    y=trend,
-                    name=f"{metric} trend",
-                    mode="lines",
-                    line=dict(color=color_lookup.get(metric), dash="dash"),
-                    showlegend=True,
+            for metric in ["Revenue", "Expenses", "Net"]:
+                if metric not in daily_sorted.columns or len(daily_sorted) < 2:
+                    continue
+                y_vals = daily_sorted[metric].to_numpy(dtype=float)
+                if not np.isfinite(y_vals).any() or np.unique(ordinal_days).size < 2:
+                    continue
+                coeffs = np.polyfit(ordinal_days, y_vals, 1)
+                trend = coeffs[0] * ordinal_days + coeffs[1]
+                fig.add_trace(
+                    go.Scatter(
+                        x=daily_sorted["Day"],
+                        y=trend,
+                        name=f"{metric} trend",
+                        mode="lines",
+                        line=dict(color=color_lookup.get(metric), dash="dash"),
+                        showlegend=True,
+                    )
+                )
+                avg_val = float(np.nanmean(y_vals))
+                if np.isfinite(avg_val):
+                    fig.add_hline(
+                        y=avg_val,
+                        line_dash="dot",
+                        line_color=color_lookup.get(metric),
+                        annotation_text=f"{metric} avg {fmt_money(avg_val)}",
+                        annotation_position=avg_positions.get(metric, "top left"),
+                    )
+
+            st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+            st.caption(
+                "Daily averages — Revenue: {} • Expenses: {} • Net: {}".format(
+                    fmt_money(np.nanmean(daily_sorted["Revenue"])),
+                    fmt_money(np.nanmean(daily_sorted["Expenses"])),
+                    fmt_money(np.nanmean(daily_sorted["Net"])),
                 )
             )
-            avg_val = float(np.nanmean(y_vals))
-            if np.isfinite(avg_val):
-                fig.add_hline(
-                    y=avg_val,
-                    line_dash="dot",
-                    line_color=color_lookup.get(metric),
-                    annotation_text=f"{metric} avg {fmt_money(avg_val)}",
-                    annotation_position=avg_positions.get(metric, "top left"),
-                )
-
-        st.plotly_chart(fig, use_container_width=True, theme="streamlit")
-        st.caption(
-            "Daily averages — Revenue: {} • Expenses: {} • Net: {}".format(
-                fmt_money(np.nanmean(daily_sorted["Revenue"])),
-                fmt_money(np.nanmean(daily_sorted["Expenses"])),
-                fmt_money(np.nanmean(daily_sorted["Net"])),
-            )
-        )
 
     with tab2:
-        # Ensure YearMonth exists on the filtered frame
-        if "YearMonth" not in df.columns:
-            df["YearMonth"] = df["Date"].dt.to_period("M")
+        if monthly.empty:
+            st.info("Not enough monthly data to chart.")
+        else:
+            m_df = monthly.copy()
+            m_df_display = m_df.copy()
+            m_df_display["YearMonthLabel"] = format_month_period(m_df_display["YearMonth"])
 
-        # Build monthly aggregates using abs() and a temporary 'Abs' column
-        monthly_rev = (
-            rev.assign(Abs=lambda d: d["Amount"].abs())
-               .groupby("YearMonth", as_index=False)["Abs"].sum()
-               .rename(columns={"Abs": "Revenue"})
-        )
-        monthly_exp = (
-            exp.assign(Abs=lambda d: d["Amount"].abs())
-               .groupby("YearMonth", as_index=False)["Abs"].sum()
-               .rename(columns={"Abs": "Expenses"})
-        )
-
-        # Merge and plot
-        m_df = pd.merge(monthly_rev, monthly_exp, on="YearMonth", how="outer").fillna(0.0)
-        m_df = m_df.sort_values("YearMonth")
-        m_df_display = m_df.copy()
-        m_df_display["YearMonthLabel"] = format_month_period(m_df_display["YearMonth"])
-
-        fig2 = px.bar(
-            m_df_display, x="YearMonthLabel", y=["Revenue", "Expenses"],
-            barmode="group", title="Monthly Revenue vs Expenses"
-        )
-        fig2.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
-        fig2.update_xaxes(tickformat="%m/%Y")
-
-        color_lookup2 = {trace.name: getattr(trace.marker, "color", None) for trace in fig2.data}
-        month_ordinals = m_df["YearMonth"].dt.to_timestamp().map(pd.Timestamp.toordinal).to_numpy()
-        avg_positions2 = {"Revenue": "top left", "Expenses": "top right"}
-
-        for metric in ["Revenue", "Expenses"]:
-            if metric not in m_df.columns or len(m_df) < 2:
-                continue
-            y_vals = m_df[metric].to_numpy(dtype=float)
-            if not np.isfinite(y_vals).any() or np.unique(month_ordinals).size < 2:
-                continue
-            coeffs = np.polyfit(month_ordinals, y_vals, 1)
-            trend = coeffs[0] * month_ordinals + coeffs[1]
-            fig2.add_trace(
-                go.Scatter(
-                    x=m_df_display["YearMonthLabel"],
-                    y=trend,
-                    name=f"{metric} trend",
-                    mode="lines",
-                    line=dict(color=color_lookup2.get(metric), dash="dash"),
-                    showlegend=True,
-                )
+            fig2 = px.bar(
+                m_df_display,
+                x="YearMonthLabel",
+                y=["Revenue", "Expenses"],
+                barmode="group",
+                title="Monthly Revenue vs Expenses",
             )
-            avg_val = float(np.nanmean(y_vals))
-            if np.isfinite(avg_val):
+            fig2.update_layout(legend_title=None, xaxis_title=None, yaxis_title="Amount")
+            fig2.update_xaxes(tickformat="%m/%Y")
+
+            color_lookup2 = {trace.name: getattr(trace.marker, "color", None) for trace in fig2.data}
+            month_ordinals = m_df["YearMonth"].dt.to_timestamp().map(pd.Timestamp.toordinal).to_numpy()
+            avg_positions2 = {"Revenue": "top left", "Expenses": "top right"}
+
+            for metric in ["Revenue", "Expenses"]:
+                if metric not in m_df.columns or len(m_df) < 2:
+                    continue
+                y_vals = m_df[metric].to_numpy(dtype=float)
+                if not np.isfinite(y_vals).any() or np.unique(month_ordinals).size < 2:
+                    continue
+                coeffs = np.polyfit(month_ordinals, y_vals, 1)
+                trend = coeffs[0] * month_ordinals + coeffs[1]
+                fig2.add_trace(
+                    go.Scatter(
+                        x=m_df_display["YearMonthLabel"],
+                        y=trend,
+                        name=f"{metric} trend",
+                        mode="lines",
+                        line=dict(color=color_lookup2.get(metric), dash="dash"),
+                        showlegend=True,
+                    )
+                )
+                avg_val = float(np.nanmean(y_vals))
+                if np.isfinite(avg_val):
+                    fig2.add_hline(
+                        y=avg_val,
+                        line_dash="dot",
+                        line_color=color_lookup2.get(metric),
+                        annotation_text=f"{metric} avg {fmt_money(avg_val)}",
+                        annotation_position=avg_positions2.get(metric, "top left"),
+                    )
+
+            if rev_target:
                 fig2.add_hline(
-                    y=avg_val,
-                    line_dash="dot",
-                    line_color=color_lookup2.get(metric),
-                    annotation_text=f"{metric} avg {fmt_money(avg_val)}",
-                    annotation_position=avg_positions2.get(metric, "top left"),
+                    y=rev_target,
+                    line_dash="dash",
+                    line_color=color_lookup2.get("Revenue", "#2ca02c"),
+                    annotation_text=f"Revenue target {fmt_money(rev_target)}",
+                    annotation_position="bottom left",
+                )
+            if exp_target:
+                fig2.add_hline(
+                    y=exp_target,
+                    line_dash="dash",
+                    line_color=color_lookup2.get("Expenses", "#d62728"),
+                    annotation_text=f"Expenses target {fmt_money(exp_target)}",
+                    annotation_position="bottom right",
                 )
 
-        if rev_target:
-            fig2.add_hline(
-                y=rev_target,
-                line_dash="dash",
-                line_color=color_lookup2.get("Revenue", "#2ca02c"),
-                annotation_text=f"Revenue target {fmt_money(rev_target)}",
-                annotation_position="bottom left",
-            )
-        if exp_target:
-            fig2.add_hline(
-                y=exp_target,
-                line_dash="dash",
-                line_color=color_lookup2.get("Expenses", "#d62728"),
-                annotation_text=f"Expenses target {fmt_money(exp_target)}",
-                annotation_position="bottom right",
-            )
-
-        st.plotly_chart(fig2, use_container_width=True, theme="streamlit")
-        if not m_df.empty:
+            st.plotly_chart(fig2, use_container_width=True, theme="streamlit")
             st.caption(
                 "Monthly averages — Revenue: {} • Expenses: {}".format(
                     fmt_money(np.nanmean(m_df["Revenue"])),
                     fmt_money(np.nanmean(m_df["Expenses"])),
                 )
             )
+
+    forecast_df = compute_13_week_forecast(df)
+    forecast_fig = build_forecast_chart(forecast_df)
+    if forecast_fig is not None:
+        st.plotly_chart(forecast_fig, use_container_width=True, theme="streamlit")
+        if forecast_df is not None:
+            future = forecast_df[forecast_df["is_forecast"]]
+            if not future.empty:
+                avg_daily_net = float(future["Net"].mean())
+                if avg_daily_net < 0 and kpi["cash"] > 0:
+                    days_to_zero = kpi["cash"] / abs(avg_daily_net)
+                    projected_date = future["Day"].min() + pd.to_timedelta(days_to_zero, unit="D")
+                    st.caption(
+                        f"Implied runway exhaustion date: {format_dayfirst_scalar(projected_date)} (assuming forecast burn)."
+                    )
 else:
     st.info("No rows match your filters. Adjust the date range or Type filter.")
 
