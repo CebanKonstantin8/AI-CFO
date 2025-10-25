@@ -28,7 +28,7 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
     Robustly parse a mixed 'Date' column:
       - Excel serials (1900 or 1904 epoch auto-detected)
       - EU strings (dd.mm.yyyy, dd/mm/yyyy, dd-mm-yyyy) -> dayfirst
-      - ISO/US fallbacks
+      - ISO fallbacks (preserve day-first semantics)
     Returns tz-naive timestamps; unparseable -> NaT.
     """
     s = series.copy()
@@ -61,11 +61,21 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
                     .str.replace(r"\s+.*$", "", regex=True))  # drop trailing time words if any
 
     # EU-first pass (dayfirst=True)
-    parsed1 = pd.to_datetime(s_norm, errors="coerce", dayfirst=True, infer_datetime_format=True)
+    parsed1 = pd.to_datetime(
+        s_norm,
+        errors="coerce",
+        dayfirst=True,
+        infer_datetime_format=True,
+    )
     need2 = parsed1.isna()
     if need2.any():
-        # Fallback pass (ISO/US)
-        parsed2 = pd.to_datetime(s_str[need2], errors="coerce", dayfirst=False, infer_datetime_format=True)
+        # Fallback pass maintains day-first semantics while attempting less-normalised strings
+        parsed2 = pd.to_datetime(
+            s_str[need2],
+            errors="coerce",
+            dayfirst=True,
+            infer_datetime_format=True,
+        )
         parsed1.loc[need2] = parsed2
 
     out.loc[str_mask] = parsed1
@@ -782,7 +792,7 @@ if not df.empty:
     daily = pd.concat([daily_rev, daily_exp], axis=1).fillna(0.0)
     daily["Net"] = daily["Revenue"] - daily["Expenses"]
     daily = daily.reset_index().rename(columns={"index": "Day", "Date": "Day"})
-    daily["Day"] = pd.to_datetime(daily["Day"])
+    daily["Day"] = pd.to_datetime(daily["Day"], dayfirst=True)
 
     tab1, tab2 = st.tabs(["Daily Net", "Monthly Revenue vs Expenses"])
 
