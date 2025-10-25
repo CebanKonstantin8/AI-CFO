@@ -1505,7 +1505,7 @@ if vendor_summary is not None and not vendor_summary.empty:
             name="Cumulative %",
             mode="lines+markers",
             yaxis="y2",
-        )
+        ))
 st.markdown("### 📥 Download")
 colx, coly = st.columns(2)
 with colx:
