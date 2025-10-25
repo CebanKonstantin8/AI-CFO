@@ -843,6 +843,7 @@ with st.expander("Calculation audit"):
             "Revenues": int((df['Type'] == 'REVENUE').sum()),
             "Expenses": int((df['Type'] == 'EXPENSE').sum()),
         })
+
     with right:
         st.write("**Monthly expenses used for burn (filtered period)**")
         if "YearMonth" not in df.columns:
@@ -855,10 +856,14 @@ with st.expander("Calculation audit"):
             st.write("**Burn (mean):**", fmt_money(burn_series.mean()))
         else:
             st.write("No expenses in filtered period.")
+
+    # <- still inside "Calculation audit"
     with st.expander("Date parsing diagnostics"):
-    sample = df_raw.head(30).copy()
-    sample["_raw_Date"] = series = sample["Date"]
-    sample["_parsed_Date"] = smart_parse_dates(series)
-    sample["_parsed_Date_str"] = sample["_parsed_Date"].dt.strftime("%Y-%m-%d")
-    st.dataframe(sample[["_raw_Date", "_parsed_Date_str"]])
+        sample = df_raw.head(30).copy()
+        sample["_raw_Date"] = sample["Date"]
+        parsed = smart_parse_dates(sample["_raw_Date"])
+        sample["_parsed_Date"] = parsed
+        sample["_parsed_Date_str"] = parsed.dt.strftime("%Y-%m-%d")
+        st.dataframe(sample[["_raw_Date", "_parsed_Date_str"]])
+
 
