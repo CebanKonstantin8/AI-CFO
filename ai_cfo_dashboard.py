@@ -3,6 +3,7 @@
 # Expects a sheet named "transaction" with columns:
 # Date | Type | Category | Description | Amount
 
+import datetime as dt
 import io
 import numpy as np
 import pandas as pd
@@ -54,8 +55,14 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
                                 origin="1904-01-01", errors="coerce")
         out.loc[excel_mask] = d1
 
-    # ---------- 2) Handle strings
-    str_mask = ~excel_mask
+    # ---------- 2) Preserve existing datetime/date objects as-is
+    date_like_mask = s.apply(lambda x: isinstance(x, (pd.Timestamp, dt.datetime, dt.date)))
+    if date_like_mask.any():
+        existing = pd.to_datetime(s.loc[date_like_mask], errors="coerce")
+        out.loc[date_like_mask] = existing
+
+    # ---------- 3) Handle strings and everything else
+    str_mask = ~(excel_mask | date_like_mask)
     s_str = s.loc[str_mask].astype(str).str.strip()
 
     # Quick normalization: replace common separators with '-' for parser stability
@@ -82,7 +89,7 @@ def smart_parse_dates(series: pd.Series) -> pd.Series:
 
     out.loc[str_mask] = parsed1
 
-    # ---------- 3) Ensure tz-naive
+    # ---------- 4) Ensure tz-naive
     try:
         if getattr(out.dt, "tz", None) is not None:
             out = out.dt.tz_localize(None)
